@@ -4,6 +4,8 @@
 
 یک برنامه دسکتاپ ویندوز برای مدیریت پروکسی‌های Slipstream، اسکن سریع DNS، و مسیریابی ترافیک با `sing-box` در یک رابط کاربری ساده و قدرتمند.
 
+**نکته:** این برنامه کلاینت Slipstream است.
+
 **نسخه CLI**: [Slipstreamplus-CLI](https://github.com/payeh/Slipstreamplus-CLI)
 
 ## ✨ امکانات اصلی

@@ -4,6 +4,8 @@
 
 A Windows desktop app for managing Slipstream-based proxies, scanning DNS endpoints, and routing traffic through `sing-box` with an easy GUI.
 
+**Note:** This app is a Slipstream client.
+
 **CLI Version**: [Slipstreamplus-CLI](https://github.com/payeh/Slipstreamplus-CLI)
 
 ## ✨ Key Features
