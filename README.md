@@ -1,5 +1,7 @@
 ﻿# Slipstream Plus 🚀
 
+**فارسی | English**: `README-fa.md` | `README.md`
+
 A Windows desktop app for managing Slipstream-based proxies, scanning DNS endpoints, and routing traffic through `sing-box` with an easy GUI.
 
 ## ✨ Key Features
