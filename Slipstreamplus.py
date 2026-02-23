@@ -1,4 +1,5 @@
 import sys
+import signal
 import os
 import subprocess
 import threading
@@ -8,9 +9,14 @@ import json
 import atexit
 import random
 import ipaddress
-import ctypes
-import winreg
 import ssl
+try:
+    import ctypes
+    import winreg
+except ImportError:
+    ctypes = None  # type: ignore
+    winreg = None  # type: ignore
+
 from urllib.parse import unquote, quote, urlparse, parse_qs
 from queue import Queue, Empty
 from typing import Optional, List, Dict, Tuple
@@ -85,7 +91,12 @@ def resource_path(relative_path: str) -> str:
 
 
 def bin_path(filename: str) -> str:
-    return resource_path(os.path.join("bin", filename))
+    path = resource_path(os.path.join("bin", filename))
+    if os.name != "nt" and os.path.exists(path):
+        import stat
+        st = os.stat(path)
+        os.chmod(path, st.st_mode | stat.S_IEXEC)
+    return path
 
 
 def config_path(filename: str) -> str:
@@ -135,6 +146,13 @@ DEFAULT_CONFIG: Dict[str, object] = {
 }
 
 SPEED_TEST_URL = "https://cachefly.cachefly.net/10mb.test"
+
+if sys.platform == "win32":
+    SLIPSTREAM_BIN = "slipstream-client-windows-amd64.exe"
+    SINGBOX_BIN = "sing-box.exe"
+else:
+    SLIPSTREAM_BIN = "slipstream-client-linux-amd64"
+    SINGBOX_BIN = "sing-box"
 
 
 # ================= Utils =================
@@ -301,16 +319,21 @@ def save_config(config_data: Dict[str, object]) -> None:
 
 
 def taskkill_names(names: List[str]) -> None:
-    if os.name != "nt":
-        return
     for n in names:
         try:
-            subprocess.run(
-                f"taskkill /F /IM {n}",
-                shell=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            if os.name == "nt":
+                subprocess.run(
+                    f"taskkill /F /IM {n}",
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.run(
+                    ["killall", "-9", n],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
         except Exception:
             pass
 
@@ -334,15 +357,20 @@ def interrupt_process(proc: Optional[subprocess.Popen]) -> bool:
 
 
 # ================= System Proxy Utils =================
-INTERNET_SETTINGS = winreg.OpenKey(
-    winreg.HKEY_CURRENT_USER,
-    r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-    0,
-    winreg.KEY_ALL_ACCESS,
-)
+try:
+    INTERNET_SETTINGS = winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        0,
+        winreg.KEY_ALL_ACCESS,
+    )
+except Exception:
+    INTERNET_SETTINGS = None
 
 
 def set_system_proxy(port: int) -> bool:
+    if sys.platform != "win32" or not INTERNET_SETTINGS:
+        return False
     try:
         winreg.SetValueEx(INTERNET_SETTINGS, "ProxyEnable", 0, winreg.REG_DWORD, 1)
         winreg.SetValueEx(INTERNET_SETTINGS, "ProxyServer", 0, winreg.REG_SZ, f"127.0.0.1:{port}")
@@ -354,6 +382,8 @@ def set_system_proxy(port: int) -> bool:
 
 
 def clear_system_proxy() -> bool:
+    if sys.platform != "win32" or not INTERNET_SETTINGS:
+        return False
     try:
         winreg.SetValueEx(INTERNET_SETTINGS, "ProxyEnable", 0, winreg.REG_DWORD, 0)
         ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)
@@ -2174,11 +2204,11 @@ class App(QWidget):
         username: str = "",
         password: str = "",
     ) -> Tuple[Optional[subprocess.Popen], int, bool]:
-        slip_path = bin_path("slipstream-client-windows-amd64.exe")
+        slip_path = bin_path(SLIPSTREAM_BIN)
         if not os.path.exists(slip_path):
-            slip_path = "slipstream-client-windows-amd64.exe"
+            slip_path = SLIPSTREAM_BIN
         if not os.path.exists(slip_path):
-            self.emitter.log.emit("ERROR", "Proxy: slipstream-client-windows-amd64.exe not found.")
+            self.emitter.log.emit("ERROR", f"Proxy: {SLIPSTREAM_BIN} not found.")
             return None, 0, False
 
         port = get_free_port()
@@ -3612,7 +3642,7 @@ class App(QWidget):
             except Exception:
                 pass
         if os.name == "nt":
-            taskkill_names(["slipstream-client-windows-amd64.exe"])
+            taskkill_names([SLIPSTREAM_BIN])
         self.proc_tunnel = None
 
         domain = (domain_override or self.domain_input.text().strip()).strip()
@@ -4343,9 +4373,9 @@ class App(QWidget):
         self.start_monitor_thread()
 
     def spawn_slipstream_tunnel(self, dns_ip: str, domain: str) -> None:
-        slip_path = bin_path("slipstream-client-windows-amd64.exe")
+        slip_path = bin_path(SLIPSTREAM_BIN)
         if not os.path.exists(slip_path):
-            slip_path = "slipstream-client-windows-amd64.exe"
+            slip_path = SLIPSTREAM_BIN
 
         resolver_args = _resolver_args_from_dns(dns_ip)
         if not resolver_args:
@@ -4372,7 +4402,7 @@ class App(QWidget):
             )
             threading.Thread(target=self.pipe_reader, args=(self.proc_tunnel, "SLIPSTREAM"), daemon=True).start()
         except FileNotFoundError:
-            self.emitter.log.emit("ERROR", "slipstream-client-windows-amd64.exe not found.")
+            self.emitter.log.emit("ERROR", f"{SLIPSTREAM_BIN} not found.")
             self.stop_connection()
 
     def spawn_singbox(self) -> None:
@@ -4532,7 +4562,7 @@ class App(QWidget):
                 except Exception:
                     pass
         if os.name == "nt":
-            taskkill_names(["slipstream-client-windows-amd64.exe", "sing-box.exe"])
+            taskkill_names([SLIPSTREAM_BIN, SINGBOX_BIN])
         self.proc_tunnel = None
         self.proc_singbox = None
 
@@ -4721,6 +4751,10 @@ if __name__ == "__main__":
     except Exception:
         pass
 
+    if sys.platform == "linux":
+        # Force X11 backend to avoid Wayland/Input Method segfaults on some distros
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
+
     app = QApplication(sys.argv)
     shared = QSharedMemory(APP_ID)
     if not shared.create(1):
@@ -4748,4 +4782,17 @@ if __name__ == "__main__":
 
     w = App()
     w.show()
+
+    # Allow Ctrl+C to close the app
+    def signal_handler(sig, frame):
+        print("\nCtrl+C caught. Exiting...")
+        w.close_app()
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Timer to let Python interpreter run periodically to catch signals
+    timer = QTimer()
+    timer.start(200)
+    timer.timeout.connect(lambda: None)
+
     sys.exit(app.exec())

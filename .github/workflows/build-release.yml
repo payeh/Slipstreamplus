@@ -1,0 +1,161 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  detect-version:
+    runs-on: ubuntu-latest
+    outputs:
+      is_prerelease: ${{ steps.check_prerelease.outputs.is_prerelease }}
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Get version
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Check prerelease
+        id: check_prerelease
+        run: |
+          if [[ "${{ steps.get_version.outputs.version }}" == *"dev"* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-windows:
+    runs-on: windows-latest
+    needs: detect-version
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6 websocket-client pyinstaller
+
+      - name: Download Core Binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if (!(Test-Path "bin")) { mkdir bin }
+          # Download Slipstream Client
+          gh release download -R Fox-Fig/slipstream-rust-plus-deploy -p "slipstream-client-windows-amd64.exe" -D bin --clobber
+          
+          # Download Sing-box
+          gh release download -R SagerNet/sing-box -p "*windows-amd64.zip" --clobber
+          7z x sing-box-*-windows-amd64.zip -o"." -y
+          Move-Item -Path sing-box-*-windows-amd64/sing-box.exe -Destination bin/sing-box.exe -Force
+          
+          dir bin
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --noconfirm --clean `
+            --onefile --windowed --name "SlipstreamPlus-Windows" `
+            --add-data "bin;bin" `
+            --add-data "asset;asset" `
+            --add-data "geo;geo" `
+            --add-data "cidrs;cidrs" `
+            --add-data "README-fa.md;." `
+            --icon "icon.ico" `
+            Slipstreamplus.py
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SlipstreamPlus-Windows
+          path: dist/SlipstreamPlus-Windows.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    needs: detect-version
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PySide6 websocket-client pyinstaller
+
+      - name: Download Core Binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p bin
+          # Download Slipstream Client
+          gh release download -R Fox-Fig/slipstream-rust-plus-deploy -p "slipstream-client-linux-amd64" -D bin --clobber
+          chmod +x bin/slipstream-client-linux-amd64
+          
+          # Download Sing-box
+          gh release download -R SagerNet/sing-box -p "*linux-amd64.tar.gz" --clobber
+          tar -xzf sing-box-*-linux-amd64.tar.gz
+          mv sing-box-*-linux-amd64/sing-box bin/sing-box
+          chmod +x bin/sing-box
+          
+          ls -l bin/
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --noconfirm --clean \
+            --onefile --windowed --name "SlipstreamPlus-Linux" \
+            --add-data "bin:bin" \
+            --add-data "asset:asset" \
+            --add-data "geo:geo" \
+            --add-data "cidrs:cidrs" \
+            --add-data "README-fa.md:." \
+            Slipstreamplus.py
+          
+          cd dist
+          zip -r SlipstreamPlus-Linux.zip SlipstreamPlus-Linux
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SlipstreamPlus-Linux
+          path: dist/SlipstreamPlus-Linux.zip
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [detect-version, build-windows, build-linux]
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+
+      - name: Delete Existing Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete ${{ github.ref_name }} --yes || echo "No release to delete"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/SlipstreamPlus-Windows/SlipstreamPlus-Windows.exe
+            artifacts/SlipstreamPlus-Linux/SlipstreamPlus-Linux.zip
+          prerelease: ${{ needs.detect-version.outputs.is_prerelease == 'true' }}
+          generate_release_notes: true
+          append_body: false
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          fail_on_unmatched_files: true
