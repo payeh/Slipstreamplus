@@ -55,26 +55,50 @@ jobs:
           gh release download -R SagerNet/sing-box -p "*windows-amd64.zip" --clobber
           7z x sing-box-*-windows-amd64.zip -o"." -y
           Move-Item -Path sing-box-*-windows-amd64/sing-box.exe -Destination bin/sing-box.exe -Force
+
+          # Download DNSTT client
+          Invoke-WebRequest -Uri "https://dnstt.network/dnstt-client-windows-amd64.exe" -OutFile "bin/dnstt-client-windows-amd64.exe"
+
+          # Download Wintun (for TUN mode)
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile "wintun.zip"
+          Expand-Archive -Force "wintun.zip" "wintun-tmp"
+          $wintun = Get-ChildItem -Path "wintun-tmp" -Recurse -Filter "wintun.dll" | Where-Object { $_.FullName -match \"amd64\" } | Select-Object -First 1
+          if ($wintun) { Copy-Item -Force $wintun.FullName \"bin/wintun.dll\" }
+          Remove-Item -Force \"wintun.zip\"
+          Remove-Item -Recurse -Force \"wintun-tmp\"
           
           dir bin
 
       - name: Build with PyInstaller
         run: |
           pyinstaller --noconfirm --clean `
-            --onefile --windowed --name "SlipstreamPlus-Windows" `
-            --add-data "bin;bin" `
-            --add-data "asset;asset" `
-            --add-data "geo;geo" `
-            --add-data "cidrs;cidrs" `
-            --add-data "README-fa.md;." `
+            --onedir --windowed --name "SlipstreamPlus-Windows" `
             --icon "icon.ico" `
             Slipstreamplus.py
+
+      - name: Stage Runtime Folders Next To EXE
+        run: |
+          $outDir = \"dist\\SlipstreamPlus-Windows\"
+          Copy-Item -Recurse -Force \"bin\" $outDir
+          Copy-Item -Recurse -Force \"asset\" $outDir
+          Copy-Item -Recurse -Force \"geo\" $outDir
+          Copy-Item -Recurse -Force \"cidrs\" $outDir
+          Copy-Item -Force \"README.md\" $outDir
+          Copy-Item -Force \"README-fa.md\" $outDir
+          if (Test-Path \"screen.jpg\") { Copy-Item -Force \"screen.jpg\" $outDir }
+
+      - name: Package (ZIP)
+        run: |
+          $tag = \"${{ github.ref_name }}\"
+          $zipName = \"SlipstreamPlus-$tag-windows-amd64.zip\"
+          if (Test-Path $zipName) { Remove-Item -Force $zipName }
+          Compress-Archive -Path \"dist\\SlipstreamPlus-Windows\\*\" -DestinationPath $zipName
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: SlipstreamPlus-Windows
-          path: dist/SlipstreamPlus-Windows.exe
+          path: SlipstreamPlus-${{ github.ref_name }}-windows-amd64.zip
 
   build-linux:
     runs-on: ubuntu-latest
@@ -112,22 +136,30 @@ jobs:
       - name: Build with PyInstaller
         run: |
           pyinstaller --noconfirm --clean \
-            --onefile --windowed --name "SlipstreamPlus-Linux" \
-            --add-data "bin:bin" \
-            --add-data "asset:asset" \
-            --add-data "geo:geo" \
-            --add-data "cidrs:cidrs" \
-            --add-data "README-fa.md:." \
+            --onedir --windowed --name "SlipstreamPlus-Linux" \
             Slipstreamplus.py
-          
+
+      - name: Stage Runtime Folders Next To Binary
+        run: |
+          out_dir="dist/SlipstreamPlus-Linux"
+          cp -rf bin "$out_dir/"
+          cp -rf asset "$out_dir/"
+          cp -rf geo "$out_dir/"
+          cp -rf cidrs "$out_dir/"
+          cp -f README.md "$out_dir/"
+          cp -f README-fa.md "$out_dir/"
+          test -f screen.jpg && cp -f screen.jpg "$out_dir/" || true
+
+      - name: Package (ZIP)
+        run: |
           cd dist
-          zip -r SlipstreamPlus-Linux.zip SlipstreamPlus-Linux
+          zip -r "../SlipstreamPlus-${{ github.ref_name }}-linux-amd64.zip" SlipstreamPlus-Linux
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: SlipstreamPlus-Linux
-          path: dist/SlipstreamPlus-Linux.zip
+          path: SlipstreamPlus-${{ github.ref_name }}-linux-amd64.zip
 
   release:
     runs-on: ubuntu-latest
@@ -151,8 +183,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/SlipstreamPlus-Windows/SlipstreamPlus-Windows.exe
-            artifacts/SlipstreamPlus-Linux/SlipstreamPlus-Linux.zip
+            artifacts/SlipstreamPlus-Windows/SlipstreamPlus-${{ github.ref_name }}-windows-amd64.zip
+            artifacts/SlipstreamPlus-Linux/SlipstreamPlus-${{ github.ref_name }}-linux-amd64.zip
           prerelease: ${{ needs.detect-version.outputs.is_prerelease == 'true' }}
           generate_release_notes: true
           append_body: false

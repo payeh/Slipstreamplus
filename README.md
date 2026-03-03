@@ -19,6 +19,10 @@ A Windows desktop app that scans and tests clean DNS endpoints, connects to Slip
 - 🧬 Tunnel protocols: `SLIPSTREAM` and `DNSTT`
 
 ## 🆕 Changelog (Latest)
+**v1.1.1 (2026-03-03)**
+- Release packaging: `bin/`, `asset/`, `geo/`, `cidrs/` are shipped next to the executable (not embedded).
+- DNSTT links standardized to `DNSTT://...` (2 slashes).
+
 **v1.1.0 (2026-03-03)**
 - Fixed “connected but not working” state by adding a health monitor. If the local tunnel SOCKS listener dies/refuses, the app auto-reconnects (no manual disconnect needed).
 
@@ -67,7 +71,7 @@ SLIPSTREAM://user:pass@s.example.com:53?dns=8.8.8.8,1.1.1.1,9.9.9.9#My%20Server
 
 **DNSTT link format**
 ```
-DNSTT:////<PUBLIC_KEY_HEX>@<DOMAIN>:53?dns=<DNS_IP>#<REMARKS>
+DNSTT://<PUBLIC_KEY_HEX>@<DOMAIN>:53?dns=<DNS_IP>#<REMARKS>
 ```
 
 **Modes**
@@ -114,7 +118,7 @@ Enable **LAN Mode (Hotspot)** to share your proxy with devices on the same Wi‑
 
 ## 🧱 Build (PyInstaller)
 ```bash
-pyinstaller --noconsole --onefile --icon="icon.ico" --add-data "icon.ico;." --add-data "asset;asset" --add-data "geo;geo" Slipstreamplus.py
+pyinstaller --noconsole --onedir --icon="icon.ico" Slipstreamplus.py
 ```
 
 ## 🛠️ Troubleshooting

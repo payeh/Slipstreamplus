@@ -19,6 +19,10 @@
 - 🧬 پروتکل‌های تونل: `SLIPSTREAM` و `DNSTT`
 
 ## 🆕 تغییرات نسخه جدید
+**v1.1.1 (2026-03-03)**
+- خروجی ریلز: پوشه‌های `bin/`، `asset/`، `geo/` و `cidrs/` کنار فایل برنامه قرار می‌گیرند (داخل exe embed نمی‌شوند).
+- استانداردسازی لینک‌های DNSTT به `DNSTT://...` (با ۲ اسلش).
+
 **v1.1.0 (2026-03-03)**
 - مشکل «وصل است ولی کار نمی‌کند» رفع شد: یک Health Monitor اضافه شد که اگر SOCKS داخلی تونل روی `127.0.0.1:<port>` از کار بیفتد/Refuse بدهد، برنامه خودش Auto-Reconnect می‌کند و دیگر نیاز به Disconnect دستی نیست.
 
@@ -66,7 +70,7 @@ SLIPSTREAM://user:pass@s.example.com:53?dns=8.8.8.8,1.1.1.1,9.9.9.9#My%20Server
 
 **فرمت لینک DNSTT**
 ```
-DNSTT:////<PUBLIC_KEY_HEX>@<DOMAIN>:53?dns=<DNS_IP>#<REMARKS>
+DNSTT://<PUBLIC_KEY_HEX>@<DOMAIN>:53?dns=<DNS_IP>#<REMARKS>
 ```
 
 **مودها**
@@ -113,7 +117,7 @@ DNSTT:////<PUBLIC_KEY_HEX>@<DOMAIN>:53?dns=<DNS_IP>#<REMARKS>
 
 ## 🧱 ساخت خروجی (PyInstaller)
 ```bash
-pyinstaller --noconsole --onefile --icon="icon.ico" --add-data "icon.ico;." --add-data "asset;asset" --add-data "geo;geo" Slipstreamplus.py
+pyinstaller --noconsole --onedir --icon="icon.ico" Slipstreamplus.py
 ```
 
 ## 🛠️ رفع مشکل‌های رایج

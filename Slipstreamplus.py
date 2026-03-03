@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.0"
+APP_VERSION = "v1.1.1"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -1361,7 +1361,7 @@ class App(QWidget):
         # SLIPSTREAM://domain:53?dns=1.1.1.1,8.8.8.8#remarks
         # SLIPSTREAM://user:pass@domain:53?dns=1.1.1.1,8.8.8.8#remarks
         # DNSTT://dns@domain:53#remarks
-        # DNSTT:////pubkeyhex@domain:53?dns=1.1.1.1#remarks
+        # DNSTT://pubkeyhex@domain:53?dns=1.1.1.1#remarks
         try:
             transport = "UDP"
             raw = link.strip()
@@ -1421,6 +1421,7 @@ class App(QWidget):
             pubkey = ""
             dns_ip = ""
             raw_low = raw.lower()
+            # Backward compatibility: older builds may have emitted DNSTT:////... (4 slashes).
             if raw_low.startswith("dnstt:////"):
                 # Parse as: DNSTT:////pubkey@domain:53?dns=1.1.1.1#remarks
                 tmp = raw[10:]  # len("dnstt:////") == 10
@@ -2166,7 +2167,7 @@ class App(QWidget):
             if not is_valid_dnstt_pubkey_hex(pubkey):
                 return None
             # Canonical form with pubkey and ?dns=
-            link = f"DNSTT:////{pubkey}@{domain_val}:{port}?dns={quote(dns_ip, safe='')}"
+            link = f"DNSTT://{pubkey}@{domain_val}:{port}?dns={quote(dns_ip, safe='')}"
         else:
             use_auth = bool(username_val and password_val)
             use_query = use_auth or ("," in cert_val)
