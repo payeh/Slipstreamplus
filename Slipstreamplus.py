@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.3"
+APP_VERSION = "v1.1.4"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 

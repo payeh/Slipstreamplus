@@ -93,28 +93,28 @@ jobs:
 
       - name: Stage Runtime Folders Next To EXE
         run: |
-          $outDir = \"dist\\SlipstreamPlus-Windows\"
-          Copy-Item -Recurse -Force \"bin\" $outDir
-          Copy-Item -Recurse -Force \"asset\" $outDir
-          Copy-Item -Recurse -Force \"geo\" $outDir
-          Copy-Item -Recurse -Force \"cidrs\" $outDir
-          Copy-Item -Force \"icon.ico\" $outDir
-          Copy-Item -Force \"README.md\" $outDir
-          Copy-Item -Force \"README-fa.md\" $outDir
-          if (Test-Path \"screen.jpg\") { Copy-Item -Force \"screen.jpg\" $outDir }
+          $outDir = "dist\\SlipstreamPlus-Windows"
+          Copy-Item -Recurse -Force "bin" $outDir
+          Copy-Item -Recurse -Force "asset" $outDir
+          Copy-Item -Recurse -Force "geo" $outDir
+          Copy-Item -Recurse -Force "cidrs" $outDir
+          Copy-Item -Force "icon.ico" $outDir
+          Copy-Item -Force "README.md" $outDir
+          Copy-Item -Force "README-fa.md" $outDir
+          if (Test-Path "screen.jpg") { Copy-Item -Force "screen.jpg" $outDir }
 
       - name: Package (ZIP)
         run: |
-          $tag = \"${{ github.ref_name }}\"
-          $zipName = \"SlipstreamPlus-$tag-windows-amd64.zip\"
+          $tag = "${{ github.ref_name }}"
+          $zipName = "SlipstreamPlus-$tag-windows-amd64.zip"
           if (Test-Path $zipName) { Remove-Item -Force $zipName }
-          Compress-Archive -Path \"dist\\SlipstreamPlus-Windows\\*\" -DestinationPath $zipName
+          Compress-Archive -Path "dist\\SlipstreamPlus-Windows\\*" -DestinationPath $zipName
 
       - name: Export Extra Release Assets
         run: |
-          $tag = \"${{ github.ref_name }}\"
-          Copy-Item -Force \"bin\\dnstt-client-windows-amd64.exe\" \"dnstt-client-$tag-windows-amd64.exe\"
-          Copy-Item -Force \"bin\\wintun.dll\" \"wintun-$tag-windows-amd64.dll\"
+          $tag = "${{ github.ref_name }}"
+          Copy-Item -Force "bin\\dnstt-client-windows-amd64.exe" "dnstt-client-$tag-windows-amd64.exe"
+          Copy-Item -Force "bin\\wintun.dll" "wintun-$tag-windows-amd64.dll"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
