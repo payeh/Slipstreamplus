@@ -16,11 +16,17 @@ A Windows desktop app that scans and tests clean DNS endpoints, connects to Slip
 - 📶 LAN mode for sharing proxy with phones on the same network
 - 🔄 Auto reconnect
 - 📊 Live traffic stats (optional `websocket-client`)
+- 🧬 Tunnel protocols: `SLIPSTREAM` and `DNSTT`
+
+## 🆕 Changelog (Latest)
+**v1.1.0 (2026-03-03)**
+- Fixed “connected but not working” state by adding a health monitor. If the local tunnel SOCKS listener dies/refuses, the app auto-reconnects (no manual disconnect needed).
 
 ## ✅ Requirements
 - Windows 10/11
 - `bin/sing-box.exe`
 - `bin/slipstream-client-windows-amd64.exe`
+- `bin/dnstt-client-windows-amd64.exe` (for DNSTT)
 - Python 3.10+ if running from source
 - Python packages: `PySide6` (required), `websocket-client` (optional)
 
@@ -57,6 +63,11 @@ SLIPSTREAM://s.example.com:53?dns=1.2.3.4#My%20Server
 With auth + multi DNS:
 ```
 SLIPSTREAM://user:pass@s.example.com:53?dns=8.8.8.8,1.1.1.1,9.9.9.9#My%20Server
+```
+
+**DNSTT link format**
+```
+DNSTT:////<PUBLIC_KEY_HEX>@<DOMAIN>:53?dns=<DNS_IP>#<REMARKS>
 ```
 
 **Modes**
@@ -103,7 +114,7 @@ Enable **LAN Mode (Hotspot)** to share your proxy with devices on the same Wi‑
 
 ## 🧱 Build (PyInstaller)
 ```bash
-pyinstaller Slipstreamplus.spec
+pyinstaller --noconsole --onefile --icon="icon.ico" --add-data "icon.ico;." --add-data "asset;asset" --add-data "geo;geo" Slipstreamplus.py
 ```
 
 ## 🛠️ Troubleshooting

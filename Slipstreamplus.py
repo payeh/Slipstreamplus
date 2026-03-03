@@ -9,14 +9,17 @@ import json
 import atexit
 import random
 import ipaddress
-import ssl
 try:
     import ctypes
     import winreg
-except ImportError:
+except Exception:
     ctypes = None  # type: ignore
     winreg = None  # type: ignore
-
+import ssl
+import urllib.request
+import urllib.error
+import zipfile
+import tempfile
 from urllib.parse import unquote, quote, urlparse, parse_qs
 from queue import Queue, Empty
 from typing import Optional, List, Dict, Tuple
@@ -91,12 +94,27 @@ def resource_path(relative_path: str) -> str:
 
 
 def bin_path(filename: str) -> str:
-    path = resource_path(os.path.join("bin", filename))
-    if os.name != "nt" and os.path.exists(path):
-        import stat
-        st = os.stat(path)
-        os.chmod(path, st.st_mode | stat.S_IEXEC)
-    return path
+    return resource_path(os.path.join("bin", filename))
+
+
+def _download_to_file(url: str, out_path: str, *, timeout: int = 60) -> None:
+    req = urllib.request.Request(url, headers={"User-Agent": "SlipstreamPlus"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "wb") as f:
+        f.write(data)
+
+
+def _extract_first_matching_from_zip(zip_path: str, dest_path: str, predicate) -> bool:
+    with zipfile.ZipFile(zip_path, "r") as z:
+        for name in z.namelist():
+            if predicate(name):
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                with z.open(name) as src, open(dest_path, "wb") as dst:
+                    dst.write(src.read())
+                return True
+    return False
 
 
 def config_path(filename: str) -> str:
@@ -109,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.0"
+APP_VERSION = "v1.1.0"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -129,12 +147,36 @@ DEFAULT_CONFIG: Dict[str, object] = {
     "mixed_port": 10808,
     "lan_mode": False,
     "auto_reconnect": True,
+    "tun_mode": False,
     "last_selected_dns": "",
     "saved_results": {},
     "proxy_rows": [],
     "last_selected_proxy": "",
     "proxy_mode": "Global",
     "proxy_system_set": False,
+
+    # Advanced Networking (slipstream-client)
+    # keep-alive interval (ms) passed to slipstream-client --keep-alive-interval
+    "slip_keep_alive_interval": 400,
+    # congestion control: bbr | dcubic
+    "slip_congestion_control": "bbr",
+    # enable UDP GSO if supported (slipstream-client --gso true)
+    "slip_gso": False,
+    # optional authoritative arg for slipstream-client --authoritative <value>
+    "slip_authoritative": "",
+
+    # DNSTT settings (dnstt-client)
+    "dnstt_dns_transport": "udp",  # udp | dot | doh
+    "dnstt_doh_url": "https://1.1.1.1/dns-query",
+    "dnstt_dot_addr": "",  # optional override (host:port)
+    "dnstt_utls": "",
+    # Default DNSTT public key (optional)
+    "dnstt_pubkey_enabled": False,
+    "dnstt_pubkey_hex": "",
+
+    # Downloads
+    "download_singbox_prerelease": False,
+    "slipstream_client_url": "",
 
     # Scanner
     "fastscan_timeout_ms": 800,
@@ -146,13 +188,6 @@ DEFAULT_CONFIG: Dict[str, object] = {
 }
 
 SPEED_TEST_URL = "https://cachefly.cachefly.net/10mb.test"
-
-if sys.platform == "win32":
-    SLIPSTREAM_BIN = "slipstream-client-windows-amd64.exe"
-    SINGBOX_BIN = "sing-box.exe"
-else:
-    SLIPSTREAM_BIN = "slipstream-client-linux-amd64"
-    SINGBOX_BIN = "sing-box"
 
 
 # ================= Utils =================
@@ -198,6 +233,19 @@ def is_valid_ip(ip: str) -> bool:
     except Exception:
         return False
 
+def is_valid_dnstt_pubkey_hex(value: str) -> bool:
+    s = (value or "").strip().lower()
+    if len(s) != 64:
+        return False
+    try:
+        int(s, 16)
+        return True
+    except Exception:
+        return False
+
+def _has_dnstt_pubkey(value: str) -> bool:
+    return bool((value or "").strip())
+
 def _split_dns_csv(value: str) -> List[str]:
     parts = [p.strip() for p in value.split(",") if p.strip()]
     return _normalize_lines(parts)
@@ -221,6 +269,26 @@ def _resolver_args_from_dns(value: str) -> List[str]:
     for p in parts:
         args += ["--resolver", f"{p}:53"]
     return args
+
+
+def _ip_to_cidr(ip: str) -> Optional[str]:
+    try:
+        obj = ipaddress.ip_address(ip.strip())
+    except Exception:
+        return None
+    if obj.version == 4:
+        return f"{obj}/32"
+    return f"{obj}/128"
+
+
+def _ipv4_mapped_cidr(ip: str) -> Optional[str]:
+    try:
+        obj = ipaddress.ip_address(ip.strip())
+    except Exception:
+        return None
+    if obj.version != 4:
+        return None
+    return f"::ffff:{obj}/128"
 
 def _safe_qs_first(parsed, key: str) -> str:
     try:
@@ -319,21 +387,16 @@ def save_config(config_data: Dict[str, object]) -> None:
 
 
 def taskkill_names(names: List[str]) -> None:
+    if os.name != "nt":
+        return
     for n in names:
         try:
-            if os.name == "nt":
-                subprocess.run(
-                    f"taskkill /F /IM {n}",
-                    shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            else:
-                subprocess.run(
-                    ["killall", "-9", n],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+            subprocess.run(
+                f"taskkill /F /IM {n}",
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         except Exception:
             pass
 
@@ -356,21 +419,25 @@ def interrupt_process(proc: Optional[subprocess.Popen]) -> bool:
         return False
 
 
+def is_windows_admin() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 # ================= System Proxy Utils =================
-try:
-    INTERNET_SETTINGS = winreg.OpenKey(
-        winreg.HKEY_CURRENT_USER,
-        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-        0,
-        winreg.KEY_ALL_ACCESS,
-    )
-except Exception:
-    INTERNET_SETTINGS = None
+INTERNET_SETTINGS = winreg.OpenKey(
+    winreg.HKEY_CURRENT_USER,
+    r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+    0,
+    winreg.KEY_ALL_ACCESS,
+)
 
 
 def set_system_proxy(port: int) -> bool:
-    if sys.platform != "win32" or not INTERNET_SETTINGS:
-        return False
     try:
         winreg.SetValueEx(INTERNET_SETTINGS, "ProxyEnable", 0, winreg.REG_DWORD, 1)
         winreg.SetValueEx(INTERNET_SETTINGS, "ProxyServer", 0, winreg.REG_SZ, f"127.0.0.1:{port}")
@@ -382,8 +449,6 @@ def set_system_proxy(port: int) -> bool:
 
 
 def clear_system_proxy() -> bool:
-    if sys.platform != "win32" or not INTERNET_SETTINGS:
-        return False
     try:
         winreg.SetValueEx(INTERNET_SETTINGS, "ProxyEnable", 0, winreg.REG_DWORD, 0)
         ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)
@@ -683,6 +748,8 @@ class App(QWidget):
     def __init__(self):
         super().__init__()
         self.config = load_config()
+        self._deps_download_lock = threading.Lock()
+        self._deps_downloading = False
 
         self.setWindowTitle(APP_TITLE)
         self.resize(1050, 720)
@@ -698,6 +765,7 @@ class App(QWidget):
         self.proc_tunnel: Optional[subprocess.Popen] = None
         self.proc_singbox: Optional[subprocess.Popen] = None
         self.traffic_thread: Optional[TrafficMonitor] = None
+        self.current_dnstt_pubkey: str = ""
 
         self.running = False
         self.reconnecting = False
@@ -710,6 +778,12 @@ class App(QWidget):
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
         self.reconnect_timer: Optional[threading.Timer] = None
+
+        # Connection health monitoring (detect "connected but broken" when the local SOCKS listener dies).
+        self._health_failures = 0
+        self._health_grace_until_ts = 0.0
+        self._health_start_ts = 0.0
+        self._health_last_ok_ts = 0.0
 
         # scanner
         self.scan_running = False
@@ -923,6 +997,10 @@ class App(QWidget):
         self.auto_reconnect_chk_proxy.setChecked(bool(self.config.get("auto_reconnect", True)))
         self.auto_reconnect_chk_proxy.stateChanged.connect(self.on_auto_reconnect_changed)
 
+        self.tun_mode_chk_proxy = QCheckBox("TUN Mode (Wintun)")
+        self.tun_mode_chk_proxy.setChecked(bool(self.config.get("tun_mode", False)))
+        self.tun_mode_chk_proxy.stateChanged.connect(self.on_tun_mode_changed)
+
         self.proxy_connect_btn = QPushButton("CONNECT")
         self.proxy_connect_btn.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; padding: 6px 12px;")
         self.proxy_connect_btn.clicked.connect(self.on_connect_clicked)
@@ -938,6 +1016,7 @@ class App(QWidget):
         proxy_action_row.addSpacing(12)
         proxy_action_row.addWidget(self.lan_mode_chk_proxy)
         proxy_action_row.addWidget(self.auto_reconnect_chk_proxy)
+        proxy_action_row.addWidget(self.tun_mode_chk_proxy)
         proxy_action_row.addWidget(self.proxy_connect_btn)
         proxy_action_row.addWidget(self.proxy_clear_log_btn)
         proxy_action_row.addStretch()
@@ -1142,6 +1221,10 @@ class App(QWidget):
         self.auto_reconnect_chk.setChecked(bool(self.config.get("auto_reconnect", True)))
         self.auto_reconnect_chk.stateChanged.connect(self.on_auto_reconnect_changed)
 
+        self.tun_mode_chk = QCheckBox("TUN Mode")
+        self.tun_mode_chk.setChecked(bool(self.config.get("tun_mode", False)))
+        self.tun_mode_chk.stateChanged.connect(self.on_tun_mode_changed)
+
         conn_grid.addWidget(QLabel("DNS:"), 0, 0)
         conn_grid.addWidget(self.connect_dns_input, 0, 1)
         conn_grid.addWidget(QLabel("Mixed Port:"), 1, 0)
@@ -1150,6 +1233,7 @@ class App(QWidget):
         conn_layout.addLayout(conn_grid)
         conn_layout.addWidget(self.lan_mode_chk)
         conn_layout.addWidget(self.auto_reconnect_chk)
+        conn_layout.addWidget(self.tun_mode_chk)
 
         proxy_row = QHBoxLayout()
         self.set_sys_proxy_btn = QPushButton("Set System Proxy")
@@ -1204,6 +1288,7 @@ class App(QWidget):
         main.setContentsMargins(10, 10, 10, 10)
 
         self.update_lan_info()
+        self.update_tun_ui()
 
     # ================= Proxy Tab =================
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
@@ -1275,21 +1360,23 @@ class App(QWidget):
         # SLIPSTREAM://dns@domain:53#remarks
         # SLIPSTREAM://domain:53?dns=1.1.1.1,8.8.8.8#remarks
         # SLIPSTREAM://user:pass@domain:53?dns=1.1.1.1,8.8.8.8#remarks
+        # DNSTT://dns@domain:53#remarks
+        # DNSTT:////pubkeyhex@domain:53?dns=1.1.1.1#remarks
         try:
             transport = "UDP"
             raw = link.strip()
+            if raw.lower().startswith("dnstt:/") and not raw.lower().startswith("dnstt://"):
+                link = raw.replace("dnstt:/", "dnstt://", 1)
             if raw.lower().startswith("slipstream:/") and not raw.lower().startswith("slipstream://"):
                 transport = "UDP"
                 link = raw.replace("slipstream:/", "slipstream://", 1)
             if "://" not in link:
                 return None
             parsed = urlparse(link)
-            if parsed.scheme.strip().lower() != "slipstream":
+            scheme = parsed.scheme.strip().lower()
+            if scheme not in ("slipstream", "dnstt"):
                 return None
             remarks = unquote((parsed.fragment or "").strip())
-
-            dns_qs = unquote(_safe_qs_first(parsed, "dns"))
-            dns_norm = _normalize_dns_csv(dns_qs) if dns_qs else None
 
             domain = (parsed.hostname or "").strip()
             port = parsed.port or 0
@@ -1298,31 +1385,85 @@ class App(QWidget):
             if not self._is_valid_domain(domain):
                 return None
 
-            username = unquote(parsed.username or "").strip()
-            password = unquote(parsed.password or "").strip()
+            if scheme == "slipstream":
+                dns_qs = unquote(_safe_qs_first(parsed, "dns"))
+                dns_norm = _normalize_dns_csv(dns_qs) if dns_qs else None
 
-            if dns_norm:
-                cert_norm = dns_norm
-            else:
-                # legacy format: SLIPSTREAM://dns@domain:53#remarks
-                legacy_dns = unquote(parsed.username or "").strip()
-                cert_norm = _normalize_dns_csv(legacy_dns) if legacy_dns else None
-                # if looks like user:pass but dns missing, reject
-                if not cert_norm:
+                username = unquote(parsed.username or "").strip()
+                password = unquote(parsed.password or "").strip()
+
+                if dns_norm:
+                    cert_norm = dns_norm
+                else:
+                    # legacy format: SLIPSTREAM://dns@domain:53#remarks
+                    legacy_dns = unquote(parsed.username or "").strip()
+                    cert_norm = _normalize_dns_csv(legacy_dns) if legacy_dns else None
+                    # if looks like user:pass but dns missing, reject
+                    if not cert_norm:
+                        return None
+                    username = ""
+                    password = ""
+
+                return {
+                    "type": "SLIPSTREAM",
+                    "remarks": remarks,
+                    "address": cert_norm,
+                    "domain": domain,
+                    "port": "53",
+                    "transport": transport,
+                    "cert": cert_norm,
+                    "username": username,
+                    "password": password,
+                "public_key": "",
+                }
+
+            # DNSTT
+            pubkey = ""
+            dns_ip = ""
+            raw_low = raw.lower()
+            if raw_low.startswith("dnstt:////"):
+                # Parse as: DNSTT:////pubkey@domain:53?dns=1.1.1.1#remarks
+                tmp = raw[10:]  # len("dnstt:////") == 10
+                p2 = urlparse("dnstt://" + tmp)
+                pubkey = unquote(p2.username or "").strip()
+                domain = (p2.hostname or "").strip()
+                if (p2.port or 0) != 53 or not domain:
                     return None
-                username = ""
-                password = ""
+                dns_qs = unquote(_safe_qs_first(p2, "dns"))
+                if "," in dns_qs:
+                    return None
+                dns_ip = _primary_dns(dns_qs) if dns_qs else ""
+            else:
+                # Parse as: DNSTT://dns@domain:53#remarks or DNSTT://pubkey@domain:53?dns=...
+                dns_qs = unquote(_safe_qs_first(parsed, "dns"))
+                if dns_qs:
+                    if "," in dns_qs:
+                        return None
+                    dns_ip = _primary_dns(dns_qs)
+                    pubkey = unquote(parsed.username or "").strip()
+                else:
+                    dns_ip = unquote(parsed.username or "").strip()
+                    pubkey = ""
+
+            dns_ip = _strip_port(dns_ip)
+            if "," in dns_ip:
+                return None
+            if not is_valid_ip(dns_ip):
+                return None
+            # DNSTT requires pubkey.
+            if not pubkey or not is_valid_dnstt_pubkey_hex(pubkey):
+                return None
 
             return {
-                "type": "SLIPSTREAM",
+                "type": "DNSTT",
                 "remarks": remarks,
-                "address": cert_norm,
+                "address": dns_ip,
                 "domain": domain,
                 "port": "53",
-                "transport": transport,
-                "cert": cert_norm,
-                "username": username,
-                "password": password,
+                "transport": "UDP",
+                "public_key": pubkey,
+                "username": "",
+                "password": "",
             }
         except Exception:
             return None
@@ -1335,7 +1476,10 @@ class App(QWidget):
         self.proxy_table.insertRow(row)
         self._proxy_edit_guard = True
         try:
-            self.proxy_table.setItem(row, 0, QTableWidgetItem("SLIPSTREAM"))
+            ptype = str(data.get("type", "SLIPSTREAM") or "SLIPSTREAM").strip().upper()
+            if ptype not in ("SLIPSTREAM", "DNSTT"):
+                ptype = "SLIPSTREAM"
+            self.proxy_table.setItem(row, 0, QTableWidgetItem(ptype))
             base_remarks = data.get("remarks", "")
             remarks_item = QTableWidgetItem(base_remarks)
             remarks_item.setFont(QFont("Segoe UI Emoji"))
@@ -1347,6 +1491,7 @@ class App(QWidget):
             addr_item.setData(Qt.UserRole + 1, data.get("domain", ""))
             addr_item.setData(Qt.UserRole + 2, str(data.get("username", "") or ""))
             addr_item.setData(Qt.UserRole + 3, str(data.get("password", "") or ""))
+            addr_item.setData(Qt.UserRole + 4, str(data.get("public_key", "") or ""))
             self.proxy_table.setItem(row, 2, addr_item)
             port_item = QTableWidgetItem("53")
             port_item.setFlags(port_item.flags() & ~Qt.ItemIsEditable)
@@ -1406,6 +1551,7 @@ class App(QWidget):
                     "transport": transport_item.text() if transport_item else "TCP",
                     "username": str(addr_item.data(Qt.UserRole + 2) or ""),
                     "password": str(addr_item.data(Qt.UserRole + 3) or ""),
+                    "public_key": str(addr_item.data(Qt.UserRole + 4) or ""),
                 }
             )
         self.config["proxy_rows"] = rows
@@ -1431,12 +1577,27 @@ class App(QWidget):
                     "cert": str(row.get("address", "")),
                     "username": str(row.get("username", "")),
                     "password": str(row.get("password", "")),
+                    "public_key": str(row.get("public_key", "")),
                 }
-                addr_norm = _normalize_dns_csv(data["address"])
-                if not addr_norm:
-                    continue
-                data["address"] = addr_norm
-                data["cert"] = addr_norm
+                ptype = str(data.get("type", "slipstream")).strip().upper()
+                if ptype == "DNSTT":
+                    ip = _strip_port(_primary_dns(data["address"]))
+                    if not is_valid_ip(ip):
+                        continue
+                    data["address"] = ip
+                    data["cert"] = ip
+                    pk = str(data.get("public_key", "") or "").strip()
+                    if not pk:
+                        # DNSTT requires a pubkey.
+                        continue
+                    if not is_valid_dnstt_pubkey_hex(pk):
+                        continue
+                else:
+                    addr_norm = _normalize_dns_csv(data["address"])
+                    if not addr_norm:
+                        continue
+                    data["address"] = addr_norm
+                    data["cert"] = addr_norm
                 if not data["address"] or not data["domain"]:
                     continue
                 self._add_proxy_row(data)
@@ -1523,8 +1684,11 @@ class App(QWidget):
                 type_item = QTableWidgetItem("SLIPSTREAM")
                 type_item.setFlags(type_item.flags() & ~Qt.ItemIsEditable)
                 self.proxy_table.setItem(row, 0, type_item)
-            if type_item.text().strip().upper() != "SLIPSTREAM":
-                type_item.setText("SLIPSTREAM")
+            ptype = type_item.text().strip().upper()
+            if ptype not in ("SLIPSTREAM", "DNSTT"):
+                ptype = "SLIPSTREAM"
+            if type_item.text().strip().upper() != ptype:
+                type_item.setText(ptype)
 
             port_item = self.proxy_table.item(row, 3)
             if port_item is None:
@@ -1540,10 +1704,28 @@ class App(QWidget):
                 self.proxy_table.setItem(row, 4, transport_item)
             addr_item = self.proxy_table.item(row, 2)
             if addr_item is not None:
-                cert_val = addr_item.data(Qt.UserRole) or addr_item.text().strip()
-                if not cert_val:
-                    cert_val = addr_item.text().strip()
-                addr_item.setData(Qt.UserRole, cert_val)
+                if ptype == "DNSTT":
+                    ip = _strip_port(_primary_dns(addr_item.text().strip()))
+                    if is_valid_ip(ip):
+                        addr_item.setText(ip)
+                        addr_item.setData(Qt.UserRole, ip)
+                    # DNSTT does not use username/password
+                    addr_item.setData(Qt.UserRole + 2, "")
+                    addr_item.setData(Qt.UserRole + 3, "")
+                    # If pubkey is enabled but invalid, disable it.
+                    pubkey_enabled = bool(addr_item.data(Qt.UserRole + 5))
+                    pubkey = str(addr_item.data(Qt.UserRole + 4) or "").strip()
+                    if pubkey_enabled and pubkey and (not is_valid_dnstt_pubkey_hex(pubkey)):
+                        addr_item.setData(Qt.UserRole + 5, False)
+                        addr_item.setData(Qt.UserRole + 4, "")
+                else:
+                    # SLIPSTREAM does not use DNSTT public key fields.
+                    addr_item.setData(Qt.UserRole + 5, False)
+                    addr_item.setData(Qt.UserRole + 4, "")
+                    cert_val = addr_item.data(Qt.UserRole) or addr_item.text().strip()
+                    if not cert_val:
+                        cert_val = addr_item.text().strip()
+                    addr_item.setData(Qt.UserRole, cert_val)
         finally:
             self._proxy_edit_guard = False
         self._save_proxy_rows_to_config()
@@ -1568,9 +1750,8 @@ class App(QWidget):
         form = QFormLayout(dlg)
 
         type_edit = QComboBox()
-        type_edit.addItems(["SLIPSTREAM"])
+        type_edit.addItems(["SLIPSTREAM", "DNSTT"])
         type_edit.setCurrentText("SLIPSTREAM")
-        type_edit.setEnabled(False)
         remarks_edit = QLineEdit("")
         auth_enable_chk = QCheckBox("Enable username/password")
         auth_enable_chk.setChecked(False)
@@ -1617,6 +1798,8 @@ class App(QWidget):
 
         _add_address_row("")
         domain_edit = QLineEdit("")
+        pubkey_edit = QLineEdit("")
+        pubkey_edit.setPlaceholderText("DNSTT public key (64 hex chars)")
         port_edit = QLineEdit("53")
         port_edit.setReadOnly(True)
         port_edit.setEnabled(False)
@@ -1634,8 +1817,37 @@ class App(QWidget):
         add_addr_btn.clicked.connect(lambda: _add_address_row(""))
         form.addRow("", add_addr_btn)
         form.addRow("domain", domain_edit)
+        form.addRow("DNSTT public key", pubkey_edit)
         form.addRow("port", port_edit)
         form.addRow("Transport", transport_edit)
+
+        def _set_row_visible(field: QWidget, visible: bool) -> None:
+            field.setVisible(visible)
+            lbl = form.labelForField(field)
+            if lbl is not None:
+                lbl.setVisible(visible)
+
+        def _apply_type_ui() -> None:
+            ptype = type_edit.currentText().strip().upper()
+            is_dnstt = ptype == "DNSTT"
+
+            # DNSTT: no username/password, requires public key, single resolver.
+            auth_enable_chk.setVisible(not is_dnstt)
+            _set_row_visible(username_edit, not is_dnstt)
+            _set_row_visible(password_edit, not is_dnstt)
+            _set_row_visible(pubkey_edit, is_dnstt)
+            add_addr_btn.setEnabled(not is_dnstt)
+            if is_dnstt:
+                auth_enable_chk.setChecked(False)
+                username_edit.clear()
+                password_edit.clear()
+                # Keep only one address row.
+                while len(address_rows) > 1:
+                    w, _ = address_rows.pop()
+                    w.setParent(None)
+
+        type_edit.currentIndexChanged.connect(lambda _: _apply_type_ui())
+        _apply_type_ui()
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dlg.accept)
@@ -1654,6 +1866,10 @@ class App(QWidget):
             if not is_valid_ip(a):
                 QMessageBox.warning(self, DIALOG_TITLE, "Invalid IP(s) in address.")
                 return
+        ptype = type_edit.currentText().strip().upper()
+        if ptype == "DNSTT" and len(addr_list) > 1:
+            QMessageBox.warning(self, DIALOG_TITLE, "DNSTT supports only one DNS resolver.")
+            return
         new_addr = ",".join(addr_list)
         new_domain = domain_edit.text().strip()
         new_remarks = remarks_edit.text().strip()
@@ -1662,16 +1878,27 @@ class App(QWidget):
             return
         new_username = username_edit.text().strip() if auth_enable_chk.isChecked() else ""
         new_password = password_edit.text().strip() if auth_enable_chk.isChecked() else ""
-        new_addr_norm = _normalize_dns_csv(new_addr)
-        if not new_addr_norm:
-            QMessageBox.warning(self, DIALOG_TITLE, "Invalid IP(s) in address.")
-            return
+        if ptype == "DNSTT":
+            ip = _strip_port(_primary_dns(new_addr))
+            if not is_valid_ip(ip):
+                QMessageBox.warning(self, DIALOG_TITLE, "Invalid DNS IP for DNSTT.")
+                return
+            new_addr_norm = ip
+            pk = pubkey_edit.text().strip()
+            if not is_valid_dnstt_pubkey_hex(pk):
+                QMessageBox.warning(self, DIALOG_TITLE, "Invalid DNSTT public key (must be 64 hex chars).")
+                return
+        else:
+            new_addr_norm = _normalize_dns_csv(new_addr)
+            if not new_addr_norm:
+                QMessageBox.warning(self, DIALOG_TITLE, "Invalid IP(s) in address.")
+                return
         if not self._is_valid_domain(new_domain):
             QMessageBox.warning(self, DIALOG_TITLE, "Invalid domain.")
             return
 
         data = {
-            "type": "SLIPSTREAM",
+            "type": ptype,
             "remarks": new_remarks,
             "address": new_addr_norm,
             "domain": new_domain,
@@ -1680,6 +1907,7 @@ class App(QWidget):
             "cert": new_addr_norm,
             "username": new_username,
             "password": new_password,
+            "public_key": pk if ptype == "DNSTT" else "",
         }
         self._add_proxy_row(data)
         row = self.proxy_table.rowCount() - 1
@@ -1706,10 +1934,12 @@ class App(QWidget):
         current_domain = ""
         current_username = ""
         current_password = ""
+        current_pubkey = ""
         if addr_item is not None:
             current_domain = str(addr_item.data(Qt.UserRole + 1) or "").strip()
             current_username = str(addr_item.data(Qt.UserRole + 2) or "").strip()
             current_password = str(addr_item.data(Qt.UserRole + 3) or "").strip()
+            current_pubkey = str(addr_item.data(Qt.UserRole + 4) or "").strip()
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Edit Proxy")
@@ -1718,9 +1948,9 @@ class App(QWidget):
         form = QFormLayout(dlg)
 
         type_edit = QComboBox()
-        type_edit.addItems(["SLIPSTREAM"])
-        type_edit.setCurrentText("SLIPSTREAM")
-        type_edit.setEnabled(False)
+        type_edit.addItems(["SLIPSTREAM", "DNSTT"])
+        current_type_norm = (current_type or "SLIPSTREAM").strip().upper()
+        type_edit.setCurrentText("DNSTT" if current_type_norm == "DNSTT" else "SLIPSTREAM")
         remarks_edit = QLineEdit(current_remarks)
         auth_enable_chk = QCheckBox("Enable username/password")
         auth_enable_chk.setChecked(bool(current_username and current_password))
@@ -1770,6 +2000,8 @@ class App(QWidget):
             addr_parts = [current_address] if current_address else [""]
         for part in addr_parts:
             _add_address_row(part)
+        pubkey_edit = QLineEdit(current_pubkey)
+        pubkey_edit.setPlaceholderText("DNSTT public key (64 hex chars)")
         port_edit = QLineEdit(current_port)
         port_edit.setReadOnly(True)
         port_edit.setEnabled(False)
@@ -1788,8 +2020,38 @@ class App(QWidget):
         add_addr_btn.clicked.connect(lambda: _add_address_row(""))
         form.addRow("", add_addr_btn)
         form.addRow("domain", domain_edit)
+        form.addRow("DNSTT public key", pubkey_edit)
         form.addRow("port", port_edit)
         form.addRow("Transport", transport_edit)
+
+        def _set_row_visible(field: QWidget, visible: bool) -> None:
+            field.setVisible(visible)
+            lbl = form.labelForField(field)
+            if lbl is not None:
+                lbl.setVisible(visible)
+
+        def _apply_type_ui() -> None:
+            ptype = type_edit.currentText().strip().upper()
+            is_dnstt = ptype == "DNSTT"
+            auth_enable_chk.setVisible(not is_dnstt)
+            _set_row_visible(username_edit, not is_dnstt)
+            _set_row_visible(password_edit, not is_dnstt)
+            _set_row_visible(pubkey_edit, is_dnstt)
+            add_addr_btn.setEnabled(not is_dnstt)
+            if is_dnstt:
+                auth_enable_chk.setChecked(False)
+                username_edit.clear()
+                password_edit.clear()
+                # DNSTT supports only one resolver.
+                while len(address_rows) > 1:
+                    w, _ = address_rows.pop()
+                    w.setParent(None)
+            else:
+                # SLIPSTREAM: remove DNSTT-only fields.
+                pubkey_edit.clear()
+
+        type_edit.currentIndexChanged.connect(lambda _: _apply_type_ui())
+        _apply_type_ui()
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dlg.accept)
@@ -1808,6 +2070,10 @@ class App(QWidget):
             if not is_valid_ip(a):
                 QMessageBox.warning(self, DIALOG_TITLE, "Invalid IP(s) in address.")
                 return
+        ptype = type_edit.currentText().strip().upper()
+        if ptype == "DNSTT" and len(addr_list) > 1:
+            QMessageBox.warning(self, DIALOG_TITLE, "DNSTT supports only one DNS resolver.")
+            return
         new_addr = ",".join(addr_list)
         new_domain = domain_edit.text().strip()
         new_remarks = remarks_edit.text().strip()
@@ -1816,10 +2082,22 @@ class App(QWidget):
             return
         new_username = username_edit.text().strip() if auth_enable_chk.isChecked() else ""
         new_password = password_edit.text().strip() if auth_enable_chk.isChecked() else ""
-        new_addr_norm = _normalize_dns_csv(new_addr)
-        if not new_addr_norm:
-            QMessageBox.warning(self, DIALOG_TITLE, "Invalid IP(s) in address.")
-            return
+        if ptype == "DNSTT":
+            ip = _strip_port(_primary_dns(new_addr))
+            if not is_valid_ip(ip):
+                QMessageBox.warning(self, DIALOG_TITLE, "Invalid DNS IP for DNSTT.")
+                return
+            new_addr_norm = ip
+            pk = pubkey_edit.text().strip()
+            if not is_valid_dnstt_pubkey_hex(pk):
+                QMessageBox.warning(self, DIALOG_TITLE, "Invalid DNSTT public key (must be 64 hex chars).")
+                return
+        else:
+            new_addr_norm = _normalize_dns_csv(new_addr)
+            if not new_addr_norm:
+                QMessageBox.warning(self, DIALOG_TITLE, "Invalid IP(s) in address.")
+                return
+            pk = ""
         if not self._is_valid_domain(new_domain):
             QMessageBox.warning(self, DIALOG_TITLE, "Invalid domain.")
             return
@@ -1837,11 +2115,12 @@ class App(QWidget):
                     item.setData(Qt.UserRole + 1, new_domain)
                     item.setData(Qt.UserRole + 2, new_username)
                     item.setData(Qt.UserRole + 3, new_password)
+                    item.setData(Qt.UserRole + 4, pk)
                 if c == 1:
                     item.setData(Qt.UserRole + 3, value)
                     item.setFont(QFont("Segoe UI Emoji"))
 
-            _set_item(row, 0, type_edit.currentText())
+            _set_item(row, 0, ptype)
             _set_item(row, 1, new_remarks)
             _set_item(row, 2, new_addr_norm)
             _set_item(row, 3, port_edit.text())
@@ -1860,7 +2139,7 @@ class App(QWidget):
         if not addr_item or not addr_item.text().strip():
             return None
         t = (type_item.text().strip().upper() if type_item else "SLIPSTREAM")
-        if t != "SLIPSTREAM":
+        if t not in ("SLIPSTREAM", "DNSTT"):
             return None
         port = "53"
         if port_item and port_item.text().strip() != "53":
@@ -1879,15 +2158,25 @@ class App(QWidget):
         if not domain_val:
             return None
         cert_val = str(cert_val).strip()
-        use_auth = bool(username_val and password_val)
-        use_query = use_auth or ("," in cert_val)
-        if use_query:
-            auth_part = ""
-            if use_auth:
-                auth_part = f"{quote(username_val, safe='')}:{quote(password_val, safe='')}@"
-            link = f"{t}://{auth_part}{domain_val}:{port}?dns={quote(cert_val, safe=',')}"
+        if t == "DNSTT":
+            dns_ip = _strip_port(_primary_dns(cert_val))
+            if not is_valid_ip(dns_ip):
+                return None
+            pubkey = str(addr_item.data(Qt.UserRole + 4) or "").strip()
+            if not is_valid_dnstt_pubkey_hex(pubkey):
+                return None
+            # Canonical form with pubkey and ?dns=
+            link = f"DNSTT:////{pubkey}@{domain_val}:{port}?dns={quote(dns_ip, safe='')}"
         else:
-            link = f"{t}://{cert_val}@{domain_val}:{port}"
+            use_auth = bool(username_val and password_val)
+            use_query = use_auth or ("," in cert_val)
+            if use_query:
+                auth_part = ""
+                if use_auth:
+                    auth_part = f"{quote(username_val, safe='')}:{quote(password_val, safe='')}@"
+                link = f"{t}://{auth_part}{domain_val}:{port}?dns={quote(cert_val, safe=',')}"
+            else:
+                link = f"{t}://{cert_val}@{domain_val}:{port}"
         if remarks:
             link += f"#{quote(remarks, safe='')}"
         return link
@@ -2062,6 +2351,18 @@ class App(QWidget):
                 return username, password
         return "", ""
 
+    def _get_proxy_pubkey_for_dns_domain(self, dns_ip: str, domain: str) -> str:
+        for r in range(self.proxy_table.rowCount()):
+            data = self._get_proxy_row_data(r)
+            if not data:
+                continue
+            if data[0] == dns_ip and data[1] == domain:
+                addr_item = self.proxy_table.item(r, 2)
+                if addr_item is None:
+                    return ""
+                return str(addr_item.data(Qt.UserRole + 4) or "").strip()
+        return ""
+
     @staticmethod
     def _mask_domain(domain: str) -> str:
         d = domain.strip()
@@ -2204,11 +2505,11 @@ class App(QWidget):
         username: str = "",
         password: str = "",
     ) -> Tuple[Optional[subprocess.Popen], int, bool]:
-        slip_path = bin_path(SLIPSTREAM_BIN)
+        slip_path = bin_path("slipstream-client-windows-amd64.exe")
         if not os.path.exists(slip_path):
-            slip_path = SLIPSTREAM_BIN
+            slip_path = "slipstream-client-windows-amd64.exe"
         if not os.path.exists(slip_path):
-            self.emitter.log.emit("ERROR", f"Proxy: {SLIPSTREAM_BIN} not found.")
+            self.emitter.log.emit("ERROR", "Proxy: slipstream-client-windows-amd64.exe not found.")
             return None, 0, False
 
         port = get_free_port()
@@ -2224,9 +2525,23 @@ class App(QWidget):
             *resolver_args,
             "--domain",
             domain,
+            "--tcp-listen-host",
+            "127.0.0.1",
             "--tcp-listen-port",
             str(port),
         ]
+        # Advanced Networking options (slipstream-client)
+        ka = int(self.config.get("slip_keep_alive_interval", 400))
+        if ka > 0:
+            cmd += ["--keep-alive-interval", str(ka)]
+        cc = str(self.config.get("slip_congestion_control", "")).strip().lower()
+        if cc in ("bbr", "dcubic"):
+            cmd += ["--congestion-control", cc]
+        if bool(self.config.get("slip_gso", False)):
+            cmd += ["--gso", "true"]
+        auth = str(self.config.get("slip_authoritative", "")).strip()
+        if auth:
+            cmd += ["--authoritative", auth]
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -2256,6 +2571,81 @@ class App(QWidget):
         ready = self._wait_for_slipstream_ready_or_socks(timeout=timeout, username=username, password=password)
         if not ready:
             self.emitter.log.emit("WARN", "Proxy: SLIPSTREAM test TIMEOUT (not ready).")
+        return proc, port, ready
+
+    def _run_dnstt_test(
+        self,
+        dns_ip: str,
+        domain: str,
+        pubkey_hex: str,
+        timeout: float,
+    ) -> Tuple[Optional[subprocess.Popen], int, bool]:
+        dnstt_path = bin_path("dnstt-client-windows-amd64.exe")
+        if not os.path.exists(dnstt_path):
+            dnstt_path = "dnstt-client-windows-amd64.exe"
+        if not os.path.exists(dnstt_path):
+            self.emitter.log.emit("ERROR", "Proxy: dnstt-client-windows-amd64.exe not found.")
+            return None, 0, False
+
+        dns_ip = _strip_port(_primary_dns(dns_ip))
+        if not is_valid_ip(dns_ip):
+            self.emitter.log.emit("ERROR", "Proxy: Invalid DNSTT resolver IP.")
+            return None, 0, False
+        if not is_valid_dnstt_pubkey_hex(pubkey_hex):
+            self.emitter.log.emit("ERROR", "Proxy: DNSTT requires a public key (profile enabled+set, or Settings default).")
+            return None, 0, False
+
+        port = get_free_port()
+        self.internal_port = port
+        self.slipstream_ready_event.clear()
+        self.emitter.log.emit("INFO", f"Proxy: Starting DNSTT test -> {dns_ip} / {domain} (port {port})")
+
+        localaddr = f"127.0.0.1:{port}"
+        cmd = [dnstt_path]
+        transport = str(self.config.get("dnstt_dns_transport", "udp")).strip().lower()
+        if transport == "doh":
+            url = str(self.config.get("dnstt_doh_url", "") or "").strip()
+            if not url:
+                url = "https://1.1.1.1/dns-query"
+            cmd += ["-doh", url]
+        elif transport == "dot":
+            addr = str(self.config.get("dnstt_dot_addr", "") or "").strip()
+            if not addr:
+                addr = f"{dns_ip}:853"
+            cmd += ["-dot", addr]
+        else:
+            cmd += ["-udp", f"{dns_ip}:53"]
+        utls = str(self.config.get("dnstt_utls", "") or "").strip()
+        if utls:
+            cmd += ["-utls", utls]
+        cmd += ["-pubkey", pubkey_hex, domain, localaddr]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0,
+            )
+        except Exception as e:
+            self.emitter.log.emit("ERROR", f"Proxy: Failed to start DNSTT ({e})")
+            return None, 0, False
+
+        def _reader():
+            try:
+                if not proc.stdout:
+                    return
+                for line in proc.stdout:
+                    if line.strip():
+                        self.emitter.log.emit("DEBUG", f"[DNSTT-TEST] {line.rstrip()}")
+            except Exception:
+                pass
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+        ready = self._wait_for_slipstream_ready_or_socks(timeout=timeout, username="", password="")
+        if not ready:
+            self.emitter.log.emit("WARN", "Proxy: DNSTT test TIMEOUT (not ready).")
         return proc, port, ready
 
     def _scan_realtest_worker_loop(self) -> None:
@@ -2390,13 +2780,17 @@ class App(QWidget):
         mixed_port = 0
         try:
             self.emitter.log.emit("INFO", f"Proxy: Test Delay running for {dns_ip} / {domain}")
+            ptype = self._get_proxy_type_for_dns_domain(dns_ip, domain)
             username, password = self._get_proxy_auth_for_dns_domain(dns_ip, domain)
+            pubkey = self._get_proxy_pubkey_for_dns_domain(dns_ip, domain)
             tunnel_proc, sing_proc, mixed_port = self._run_proxy_test_core(
+                ptype,
                 dns_ip,
                 domain,
                 timeout=10.0,
                 username=username,
                 password=password,
+                public_key=pubkey,
             )
             if not tunnel_proc or not sing_proc or mixed_port <= 0:
                 self._set_proxy_cell_text(row, 5, "-1")
@@ -2535,12 +2929,16 @@ class App(QWidget):
         mixed_port = 0
         try:
             username, password = self._get_proxy_auth_for_dns_domain(dns_ip, domain)
+            ptype = self._get_proxy_type_for_dns_domain(dns_ip, domain)
+            pubkey = self._get_proxy_pubkey_for_dns_domain(dns_ip, domain)
             tunnel_proc, sing_proc, mixed_port = self._run_proxy_test_core(
+                ptype,
                 dns_ip,
                 domain,
                 timeout=10.0,
                 username=username,
                 password=password,
+                public_key=pubkey,
             )
             if not tunnel_proc or not sing_proc or mixed_port <= 0:
                 self._set_proxy_cell_text(row, 5, "-1")
@@ -2595,8 +2993,16 @@ class App(QWidget):
             color = "#64b5f6"
 
         line = f"{ts} [{level}] {msg}"
-        proxy_tags = ("Proxy", "SLIPSTREAM", "Hotspot Mode")
-        connect_tags = ("CONNECT", "System Proxy", "Auto reconnect", "LAN Mode", "SING-BOX")
+        # Route tunnel/proxy-core logs to the Proxy tab (more discoverable than Scanner/hidden tabs).
+        proxy_tags = (
+            "Proxy",
+            "SLIPSTREAM",
+            "DNSTT",
+            "SING-BOX",
+            "TUN",
+            "Hotspot Mode",
+        )
+        connect_tags = ("CONNECT", "System Proxy", "Auto reconnect", "LAN Mode")
 
         target = "main"
         if any(tag in msg for tag in proxy_tags):
@@ -2634,24 +3040,110 @@ class App(QWidget):
 
     def open_proxy_settings_dialog(self) -> None:
         dlg = QDialog(self)
-        dlg.setWindowTitle("Proxy Settings")
+        dlg.setWindowTitle("Settings")
         dlg.setWindowFlag(Qt.MSWindowsFixedSizeDialogHint, True)
         dlg.setSizeGripEnabled(False)
-        form = QFormLayout(dlg)
+        layout = QVBoxLayout(dlg)
+        tabs = QTabWidget(dlg)
+        layout.addWidget(tabs)
 
+        # --- General Settings ---
+        tab_general = QWidget()
+        general_form = QFormLayout(tab_general)
         port_spin = QSpinBox()
         port_spin.setRange(1, 65535)
         port_spin.setValue(int(self.mixed_port_input.value()))
-        form.addRow("Mixed Port", port_spin)
+        general_form.addRow("Mixed Port", port_spin)
+        tabs.addTab(tab_general, "General Setting")
+
+        # --- Slipstream Settings ---
+        tab_slip = QWidget()
+        slip_form = QFormLayout(tab_slip)
+        cc_combo = QComboBox()
+        cc_combo.addItems(["bbr", "dcubic"])
+        cc = str(self.config.get("slip_congestion_control", "bbr")).strip().lower()
+        cc_combo.setCurrentText(cc if cc in ("bbr", "dcubic") else "bbr")
+        slip_form.addRow("Congestion Control", cc_combo)
+
+        ka_spin = QSpinBox()
+        ka_spin.setRange(0, 60000)
+        ka_spin.setValue(int(self.config.get("slip_keep_alive_interval", 400)))
+        slip_form.addRow("QUIC Keep Alive (ms)", ka_spin)
+
+        gso_chk = QCheckBox("Enable GSO (if supported)")
+        gso_chk.setChecked(bool(self.config.get("slip_gso", False)))
+        slip_form.addRow("GSO", gso_chk)
+
+        authoritative_input = QLineEdit(str(self.config.get("slip_authoritative", "")))
+        authoritative_input.setPlaceholderText("optional")
+        slip_form.addRow("Authoritative", authoritative_input)
+
+        slip_url = QLineEdit(str(self.config.get("slipstream_client_url", "")))
+        slip_url.setPlaceholderText("Optional: URL to download slipstream-client if missing")
+        slip_form.addRow("Slipstream Client URL", slip_url)
+        tabs.addTab(tab_slip, "Slipstream Stting")
+
+        # --- DNSTT Settings ---
+        tab_dnstt = QWidget()
+        dnstt_form = QFormLayout(tab_dnstt)
+        dnstt_transport = QComboBox()
+        dnstt_transport.addItems(["udp", "dot", "doh"])
+        cur_transport = str(self.config.get("dnstt_dns_transport", "udp")).strip().lower()
+        dnstt_transport.setCurrentText(cur_transport if cur_transport in ("udp", "dot", "doh") else "udp")
+        dnstt_form.addRow("DNS Transport", dnstt_transport)
+
+        doh_url = QLineEdit(str(self.config.get("dnstt_doh_url", "https://1.1.1.1/dns-query")))
+        doh_url.setPlaceholderText("https://1.1.1.1/dns-query")
+        dnstt_form.addRow("DoH URL", doh_url)
+
+        dot_addr = QLineEdit(str(self.config.get("dnstt_dot_addr", "")))
+        dot_addr.setPlaceholderText("optional: resolver.example:853")
+        dnstt_form.addRow("DoT Addr", dot_addr)
+
+        utls = QLineEdit(str(self.config.get("dnstt_utls", "")))
+        utls.setPlaceholderText("optional: e.g. Chrome_120")
+        dnstt_form.addRow("uTLS", utls)
+
+        pubkey_enable = QCheckBox("Use default public key (optional)")
+        pubkey_enable.setChecked(bool(self.config.get("dnstt_pubkey_enabled", False)))
+        dnstt_form.addRow("Default PubKey", pubkey_enable)
+
+        pubkey_hex = QLineEdit(str(self.config.get("dnstt_pubkey_hex", "")))
+        pubkey_hex.setPlaceholderText("64 hex chars")
+        pubkey_hex.setEnabled(pubkey_enable.isChecked())
+        pubkey_enable.stateChanged.connect(lambda _: pubkey_hex.setEnabled(pubkey_enable.isChecked()))
+        dnstt_form.addRow("PubKey (hex)", pubkey_hex)
+
+        def _sync_dnstt_ui() -> None:
+            t = dnstt_transport.currentText().strip().lower()
+            doh_url.setEnabled(t == "doh")
+            dot_addr.setEnabled(t == "dot")
+
+        dnstt_transport.currentIndexChanged.connect(lambda _: _sync_dnstt_ui())
+        _sync_dnstt_ui()
+        tabs.addTab(tab_dnstt, "Dnstt String")
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
-        form.addRow(buttons)
+        layout.addWidget(buttons)
 
         if dlg.exec() != QDialog.Accepted:
             return
         self.mixed_port_input.setValue(int(port_spin.value()))
+        self.config["slip_congestion_control"] = str(cc_combo.currentText()).strip().lower()
+        self.config["slip_keep_alive_interval"] = int(ka_spin.value())
+        self.config["slip_gso"] = bool(gso_chk.isChecked())
+        self.config["slip_authoritative"] = str(authoritative_input.text()).strip()
+        self.config["slipstream_client_url"] = str(slip_url.text()).strip()
+        self.config["dnstt_dns_transport"] = str(dnstt_transport.currentText()).strip().lower()
+        self.config["dnstt_doh_url"] = str(doh_url.text()).strip()
+        self.config["dnstt_dot_addr"] = str(dot_addr.text()).strip()
+        self.config["dnstt_utls"] = str(utls.text()).strip()
+        self.config["dnstt_pubkey_enabled"] = bool(pubkey_enable.isChecked())
+        self.config["dnstt_pubkey_hex"] = str(pubkey_hex.text()).strip()
+        save_config(self.config)
+        self.emitter.log.emit("INFO", "Proxy: Settings saved. Reconnect to apply Advanced Networking.")
 
     def _sync_system_proxy_state(self) -> None:
         if os.name != "nt":
@@ -3642,7 +4134,7 @@ class App(QWidget):
             except Exception:
                 pass
         if os.name == "nt":
-            taskkill_names([SLIPSTREAM_BIN])
+            taskkill_names(["slipstream-client-windows-amd64.exe"])
         self.proc_tunnel = None
 
         domain = (domain_override or self.domain_input.text().strip()).strip()
@@ -3989,19 +4481,30 @@ class App(QWidget):
 
     def _run_proxy_test_core(
         self,
+        proxy_type: str,
         dns_ip: str,
         domain: str,
         timeout: float,
         username: str = "",
         password: str = "",
+        public_key: str = "",
     ) -> Tuple[Optional[subprocess.Popen], Optional[subprocess.Popen], int]:
-        tunnel_proc, internal_port, ready = self._run_slipstream_test(
-            dns_ip,
-            domain,
-            timeout=timeout,
-            username=username,
-            password=password,
-        )
+        ptype = (proxy_type or "SLIPSTREAM").strip().upper()
+        if ptype == "DNSTT":
+            tunnel_proc, internal_port, ready = self._run_dnstt_test(
+                dns_ip,
+                domain,
+                pubkey_hex=str(public_key or "").strip(),
+                timeout=timeout,
+            )
+        else:
+            tunnel_proc, internal_port, ready = self._run_slipstream_test(
+                dns_ip,
+                domain,
+                timeout=timeout,
+                username=username,
+                password=password,
+            )
         if not ready or not tunnel_proc:
             return tunnel_proc, None, 0
 
@@ -4180,6 +4683,45 @@ class App(QWidget):
                 self.auto_reconnect_chk_proxy.setChecked(self.auto_reconnect_chk.isChecked())
                 self.auto_reconnect_chk_proxy.blockSignals(False)
 
+    def on_tun_mode_changed(self) -> None:
+        sender = self.sender()
+        if sender is getattr(self, "tun_mode_chk_proxy", None):
+            if hasattr(self, "tun_mode_chk"):
+                self.tun_mode_chk.blockSignals(True)
+                self.tun_mode_chk.setChecked(self.tun_mode_chk_proxy.isChecked())
+                self.tun_mode_chk.blockSignals(False)
+        elif sender is getattr(self, "tun_mode_chk", None):
+            if hasattr(self, "tun_mode_chk_proxy"):
+                self.tun_mode_chk_proxy.blockSignals(True)
+                self.tun_mode_chk_proxy.setChecked(self.tun_mode_chk.isChecked())
+                self.tun_mode_chk_proxy.blockSignals(False)
+
+        enabled = bool(getattr(self, "tun_mode_chk", None).isChecked()) if hasattr(self, "tun_mode_chk") else False
+        self.config["tun_mode"] = enabled
+        save_config(self.config)
+        state = "enabled" if enabled else "disabled"
+        self.emitter.log.emit("INFO", f"TUN mode {state}. Reconnect to apply.")
+        self.update_tun_ui()
+
+        if enabled:
+            if not is_windows_admin():
+                self.emitter.log.emit("WARN", "TUN mode may require admin privileges on Windows.")
+            wintun_path = bin_path("wintun.dll")
+            if not os.path.exists(wintun_path):
+                self.emitter.log.emit("WARN", "TUN mode: wintun.dll not found in bin folder.")
+
+    def update_tun_ui(self) -> None:
+        enabled = bool(self.config.get("tun_mode", False))
+        if hasattr(self, "set_sys_proxy_btn"):
+            self.set_sys_proxy_btn.setEnabled(not enabled)
+        if hasattr(self, "clear_sys_proxy_btn"):
+            self.clear_sys_proxy_btn.setEnabled(not enabled)
+        if hasattr(self, "proxy_action_combo"):
+            self.proxy_action_combo.setEnabled(not enabled)
+        if enabled:
+            self.emitter.log.emit("INFO", "TUN mode is ON: system proxy controls are disabled.")
+
+
     @staticmethod
     def get_all_local_ipv4() -> List[str]:
         ips: List[str] = []
@@ -4279,7 +4821,12 @@ class App(QWidget):
         is_reconnect: bool = False,
         domain_override: Optional[str] = None,
         force_scan_domain: bool = False,
+        deps_checked: bool = False,
     ) -> None:
+        if bool(self.config.get("tun_mode", False)) and not is_windows_admin():
+            QMessageBox.critical(self, DIALOG_TITLE, "TUN Mode requires running as Administrator.")
+            return
+
         if domain_override:
             domain = domain_override.strip()
         elif force_scan_domain:
@@ -4309,6 +4856,48 @@ class App(QWidget):
             return
         target_ip = target_ip_norm
 
+        ptype = self._get_proxy_type_for_dns_domain(target_ip, domain)
+        tun_enabled = bool(self.config.get("tun_mode", False))
+        need_dnstt = ptype.strip().upper() == "DNSTT"
+        need_slip = not need_dnstt
+        need_sing = True
+        need_wintun = tun_enabled
+        if not deps_checked:
+            missing = []
+            if need_sing and not os.path.exists(bin_path("sing-box.exe")):
+                missing.append("sing-box.exe")
+            if need_wintun and not os.path.exists(bin_path("wintun.dll")):
+                missing.append("wintun.dll")
+            if need_dnstt and not os.path.exists(bin_path("dnstt-client-windows-amd64.exe")):
+                missing.append("dnstt-client-windows-amd64.exe")
+            if need_slip and not os.path.exists(bin_path("slipstream-client-windows-amd64.exe")):
+                missing.append("slipstream-client-windows-amd64.exe")
+            if missing:
+                self.emitter.log.emit("INFO", f"Downloading missing binaries: {', '.join(missing)}")
+
+                def _after(ok: bool):
+                    if not ok:
+                        QMessageBox.critical(self, DIALOG_TITLE, "Failed to download required binaries. Check log.")
+                        return
+                    self.start_connection(
+                        ip_override=ip_override,
+                        is_reconnect=is_reconnect,
+                        domain_override=domain_override,
+                        force_scan_domain=force_scan_domain,
+                        deps_checked=True,
+                    )
+
+                started = self.ensure_bin_deps_async(
+                    need_singbox=need_sing,
+                    need_wintun=need_wintun,
+                    need_slipstream=need_slip,
+                    need_dnstt=need_dnstt,
+                    done_cb=_after,
+                )
+                if not started:
+                    QMessageBox.information(self, DIALOG_TITLE, "Downloading binaries in background. Try again in a moment.")
+                return
+
         # persist settings (scan domain only)
         if domain_override is None:
             self.config["domain"] = domain
@@ -4328,8 +4917,15 @@ class App(QWidget):
         self.current_dns_ip = target_ip
         self.current_domain = domain
         self.current_proxy_remark = self._get_proxy_remark_for_dns_domain(target_ip, domain)
+        self.current_dnstt_pubkey = self._get_proxy_pubkey_for_dns_domain(target_ip, domain)
         self.current_proxy_username, self.current_proxy_password = self._get_proxy_auth_for_dns_domain(target_ip, domain)
         self.graceful_stop = False
+
+        # Give the tunnel a short window to come up before health checks start firing.
+        now = time.time()
+        self._health_start_ts = now
+        self._health_grace_until_ts = now + 10.0
+        self._health_failures = 0
 
         lan_mode = bool(self.config.get("lan_mode", False))
         listen_ip = "0.0.0.0" if lan_mode else "127.0.0.1"
@@ -4348,16 +4944,28 @@ class App(QWidget):
 
         self.update_traffic_labels("0.00 B/s", "0.00 B/s", "0.00 B", "0.00 B")
 
-        self.spawn_slipstream_tunnel(target_ip, domain)
-        if not self.proc_singbox or self.proc_singbox.poll() is not None:
-            threading.Timer(1.0, self.spawn_singbox).start()
+        singbox_not_running = (not self.proc_singbox or self.proc_singbox.poll() is not None)
+
+        if tun_enabled and singbox_not_running:
+            # In TUN mode start sing-box first to avoid route flip breaking slipstream at startup.
+            self.emitter.log.emit("INFO", "TUN: starting sing-box first, then slipstream.")
+            self.spawn_singbox()
+            threading.Timer(1.0, lambda: self.spawn_tunnel(target_ip, domain)).start()
         else:
+            self.spawn_tunnel(target_ip, domain)
+            if singbox_not_running:
+                threading.Timer(1.0, self.spawn_singbox).start()
+
+        if not singbox_not_running:
             self.running = True
             self.reconnecting = False
             self.reconnect_attempts = 0
             active_txt = self._format_active_proxy_display(target_ip, domain)
             suffix = f" | {active_txt}" if active_txt else ""
-            self.set_status(f"CONNECTED | Mixed: {listen_ip}:{self.mixed_port_input.value()}{suffix}")
+            if bool(self.config.get("tun_mode", False)):
+                self.set_status(f"CONNECTED | TUN: on{suffix}")
+            else:
+                self.set_status(f"CONNECTED | Mixed: {listen_ip}:{self.mixed_port_input.value()}{suffix}")
             if lan_mode:
                 ip = self.get_lan_ip()
                 self.emitter.log.emit("INFO", f"LAN Mode enabled. Phone proxy => {ip}:{self.mixed_port_input.value()}")
@@ -4373,9 +4981,9 @@ class App(QWidget):
         self.start_monitor_thread()
 
     def spawn_slipstream_tunnel(self, dns_ip: str, domain: str) -> None:
-        slip_path = bin_path(SLIPSTREAM_BIN)
+        slip_path = bin_path("slipstream-client-windows-amd64.exe")
         if not os.path.exists(slip_path):
-            slip_path = SLIPSTREAM_BIN
+            slip_path = "slipstream-client-windows-amd64.exe"
 
         resolver_args = _resolver_args_from_dns(dns_ip)
         if not resolver_args:
@@ -4386,9 +4994,23 @@ class App(QWidget):
             *resolver_args,
             "--domain",
             domain,
+            "--tcp-listen-host",
+            "127.0.0.1",
             "--tcp-listen-port",
             str(self.internal_port),
         ]
+        # Advanced Networking options (slipstream-client)
+        ka = int(self.config.get("slip_keep_alive_interval", 400))
+        if ka > 0:
+            cmd += ["--keep-alive-interval", str(ka)]
+        cc = str(self.config.get("slip_congestion_control", "")).strip().lower()
+        if cc in ("bbr", "dcubic"):
+            cmd += ["--congestion-control", cc]
+        if bool(self.config.get("slip_gso", False)):
+            cmd += ["--gso", "true"]
+        auth = str(self.config.get("slip_authoritative", "")).strip()
+        if auth:
+            cmd += ["--authoritative", auth]
         taskkill_names(["slipstream-client-windows-amd64.exe"])
         self.emitter.log.emit("INFO", f"Executing SLIPSTREAM with DNS: {dns_ip}")
         self.slipstream_ready_event.clear()
@@ -4402,8 +5024,159 @@ class App(QWidget):
             )
             threading.Thread(target=self.pipe_reader, args=(self.proc_tunnel, "SLIPSTREAM"), daemon=True).start()
         except FileNotFoundError:
-            self.emitter.log.emit("ERROR", f"{SLIPSTREAM_BIN} not found.")
+            self.emitter.log.emit("ERROR", "slipstream-client-windows-amd64.exe not found.")
             self.stop_connection()
+
+    def spawn_dnstt_tunnel(self, dns_ip: str, domain: str, pubkey_hex: str) -> None:
+        dnstt_path = bin_path("dnstt-client-windows-amd64.exe")
+        if not os.path.exists(dnstt_path):
+            dnstt_path = "dnstt-client-windows-amd64.exe"
+        if not os.path.exists(dnstt_path):
+            self.emitter.log.emit("ERROR", "dnstt-client-windows-amd64.exe not found.")
+            self.stop_connection()
+            return
+
+        dns_ip = _strip_port(_primary_dns(dns_ip))
+        if not is_valid_ip(dns_ip):
+            self.emitter.log.emit("ERROR", "Invalid DNSTT resolver IP.")
+            self.stop_connection()
+            return
+        if not is_valid_dnstt_pubkey_hex(pubkey_hex):
+            self.emitter.log.emit("ERROR", "DNSTT requires a public key (profile enabled+set, or Settings default).")
+            self.stop_connection()
+            return
+        if not domain or not self._is_valid_domain(domain):
+            self.emitter.log.emit("ERROR", "Invalid DNSTT domain.")
+            self.stop_connection()
+            return
+
+        localaddr = f"127.0.0.1:{int(self.internal_port)}"
+        cmd = [dnstt_path]
+        transport = str(self.config.get("dnstt_dns_transport", "udp")).strip().lower()
+        if transport == "doh":
+            url = str(self.config.get("dnstt_doh_url", "") or "").strip()
+            if not url:
+                url = "https://1.1.1.1/dns-query"
+            cmd += ["-doh", url]
+        elif transport == "dot":
+            addr = str(self.config.get("dnstt_dot_addr", "") or "").strip()
+            if not addr:
+                addr = f"{dns_ip}:853"
+            cmd += ["-dot", addr]
+        else:
+            cmd += ["-udp", f"{dns_ip}:53"]
+        utls = str(self.config.get("dnstt_utls", "") or "").strip()
+        if utls:
+            cmd += ["-utls", utls]
+        cmd += ["-pubkey", pubkey_hex, domain, localaddr]
+        taskkill_names(["dnstt-client-windows-amd64.exe"])
+        self.emitter.log.emit("INFO", f"Executing DNSTT with DNS: {dns_ip}")
+        self.slipstream_ready_event.clear()
+        try:
+            self.proc_tunnel = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0,
+            )
+            threading.Thread(target=self.pipe_reader, args=(self.proc_tunnel, "DNSTT"), daemon=True).start()
+        except FileNotFoundError:
+            self.emitter.log.emit("ERROR", "dnstt-client-windows-amd64.exe not found.")
+            self.stop_connection()
+
+    def spawn_tunnel(self, dns_ip: str, domain: str) -> None:
+        ptype = self._get_proxy_type_for_dns_domain(dns_ip, domain)
+        if ptype.strip().upper() == "DNSTT":
+            pubkey = self._get_proxy_pubkey_for_dns_domain(dns_ip, domain)
+            self.spawn_dnstt_tunnel(dns_ip, domain, pubkey)
+        else:
+            self.spawn_slipstream_tunnel(dns_ip, domain)
+
+    def _ensure_bin_deps_blocking(self, *, need_singbox: bool, need_wintun: bool, need_slipstream: bool, need_dnstt: bool) -> bool:
+        try:
+            if need_singbox and not os.path.exists(bin_path("sing-box.exe")):
+                self.emitter.log.emit("WARN", "bin/sing-box.exe missing. Downloading latest release...")
+                api = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+                req = urllib.request.Request(api, headers={"User-Agent": "SlipstreamPlus"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    rel = json.loads(resp.read().decode("utf-8", errors="ignore") or "{}")
+                assets = rel.get("assets", []) if isinstance(rel, dict) else []
+                url = ""
+                for a in assets:
+                    name = str(a.get("name", "")).lower()
+                    if "windows" in name and "amd64" in name and name.endswith(".zip"):
+                        url = str(a.get("browser_download_url", ""))
+                        break
+                if not url:
+                    self.emitter.log.emit("ERROR", "Failed to find sing-box windows-amd64 zip in latest release.")
+                    return False
+                with tempfile.TemporaryDirectory() as td:
+                    zpath = os.path.join(td, "sing-box.zip")
+                    _download_to_file(url, zpath, timeout=120)
+                    ok = _extract_first_matching_from_zip(
+                        zpath,
+                        bin_path("sing-box.exe"),
+                        lambda n: n.replace("\\", "/").endswith("/sing-box.exe") or n.replace("\\", "/") == "sing-box.exe",
+                    )
+                    if not ok:
+                        self.emitter.log.emit("ERROR", "Failed to extract sing-box.exe from zip.")
+                        return False
+
+            if need_wintun and not os.path.exists(bin_path("wintun.dll")):
+                self.emitter.log.emit("WARN", "bin/wintun.dll missing. Downloading wintun...")
+                url = "https://www.wintun.net/builds/wintun-0.14.1.zip"
+                with tempfile.TemporaryDirectory() as td:
+                    zpath = os.path.join(td, "wintun.zip")
+                    _download_to_file(url, zpath, timeout=120)
+                    ok = _extract_first_matching_from_zip(
+                        zpath,
+                        bin_path("wintun.dll"),
+                        lambda n: n.replace("\\", "/").endswith("/amd64/wintun.dll") or n.replace("\\", "/").endswith("/wintun.dll"),
+                    )
+                    if not ok:
+                        self.emitter.log.emit("ERROR", "Failed to extract wintun.dll from zip.")
+                        return False
+
+            if need_dnstt and not os.path.exists(bin_path("dnstt-client-windows-amd64.exe")):
+                self.emitter.log.emit("WARN", "bin/dnstt-client-windows-amd64.exe missing. Downloading...")
+                url = "https://dnstt.network/dnstt-client-windows-amd64.exe"
+                _download_to_file(url, bin_path("dnstt-client-windows-amd64.exe"), timeout=120)
+
+            if need_slipstream and not os.path.exists(bin_path("slipstream-client-windows-amd64.exe")):
+                url = str(self.config.get("slipstream_client_url", "") or "").strip()
+                if not url:
+                    self.emitter.log.emit("ERROR", "bin/slipstream-client-windows-amd64.exe missing and no URL set in Settings.")
+                    return False
+                self.emitter.log.emit("WARN", "bin/slipstream-client-windows-amd64.exe missing. Downloading from Settings URL...")
+                _download_to_file(url, bin_path("slipstream-client-windows-amd64.exe"), timeout=120)
+
+            return True
+        except Exception as e:
+            self.emitter.log.emit("ERROR", f"Download/install deps failed: {e}")
+            return False
+
+    def ensure_bin_deps_async(self, *, need_singbox: bool, need_wintun: bool, need_slipstream: bool, need_dnstt: bool, done_cb) -> bool:
+        with self._deps_download_lock:
+            if self._deps_downloading:
+                return False
+            self._deps_downloading = True
+
+        def worker():
+            try:
+                ok = self._ensure_bin_deps_blocking(
+                    need_singbox=need_singbox,
+                    need_wintun=need_wintun,
+                    need_slipstream=need_slipstream,
+                    need_dnstt=need_dnstt,
+                )
+            finally:
+                with self._deps_download_lock:
+                    self._deps_downloading = False
+            QTimer.singleShot(0, lambda: done_cb(ok))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
 
     def spawn_singbox(self) -> None:
         if not self.running and not self.reconnecting:
@@ -4411,6 +5184,13 @@ class App(QWidget):
 
         lan_mode = bool(self.config.get("lan_mode", False))
         listen_ip = "0.0.0.0" if lan_mode else "127.0.0.1"
+        tun_enabled = bool(self.config.get("tun_mode", False))
+        if tun_enabled:
+            if not is_windows_admin():
+                self.emitter.log.emit("WARN", "TUN mode may require admin privileges on Windows.")
+            wintun_path = bin_path("wintun.dll")
+            if not os.path.exists(wintun_path):
+                self.emitter.log.emit("WARN", "TUN mode: wintun.dll not found in bin folder.")
 
         proxy_mode = str(self.config.get("proxy_mode", "Global"))
         outbounds = [
@@ -4466,17 +5246,59 @@ class App(QWidget):
                 "final": "proxy",
             }
 
+        if tun_enabled:
+            tun_route_exclude: List[str] = []
+            tun_rules: List[Dict[str, object]] = []
+            # Prevent routing loop: keep tunnel processes on physical interface.
+            tun_rules.append(
+                {
+                    "process_name": [
+                        "slipstream-client-windows-amd64.exe",
+                        "dnstt-client-windows-amd64.exe",
+                        "sing-box.exe",
+                    ],
+                    "outbound": "direct",
+                }
+            )
+
+            resolver_ip_cidrs: List[str] = []
+            if self.current_dns_ip:
+                for ip in _split_dns_csv(self.current_dns_ip):
+                    cidr = _ip_to_cidr(ip)
+                    if cidr:
+                        resolver_ip_cidrs.append(cidr)
+                    v4_mapped = _ipv4_mapped_cidr(ip)
+                    if v4_mapped:
+                        resolver_ip_cidrs.append(v4_mapped)
+            if resolver_ip_cidrs:
+                tun_rules.append({"ip_cidr": resolver_ip_cidrs, "outbound": "direct"})
+                tun_route_exclude.extend(resolver_ip_cidrs)
+
+            # Also exclude common public DNS resolvers from OS routing to TUN.
+            for ip in ("1.1.1.1", "8.8.8.8"):
+                cidr = _ip_to_cidr(ip)
+                if cidr:
+                    tun_route_exclude.append(cidr)
+                v4_mapped = _ipv4_mapped_cidr(ip)
+                if v4_mapped:
+                    tun_route_exclude.append(v4_mapped)
+            tun_route_exclude = _normalize_lines(tun_route_exclude)
+
+            # Hijack system DNS into sing-box DNS stack in TUN mode.
+            tun_rules.append({"protocol": "dns", "action": "hijack-dns"})
+
+            if route is None:
+                route = {"rules": tun_rules, "final": "proxy"}
+            elif isinstance(route, dict):
+                route_rules = route.get("rules")
+                if isinstance(route_rules, list):
+                    route["rules"] = tun_rules + route_rules
+                else:
+                    route["rules"] = tun_rules
+
         config = {
             "log": {"level": "info"},
-            "inbounds": [
-                {
-                    "type": "mixed",
-                    "listen": listen_ip,
-                    "listen_port": int(self.mixed_port_input.value()),
-                    "sniff": True,
-                    "sniff_override_destination": True,
-                }
-            ],
+            "inbounds": [],
             "outbounds": outbounds,
             "experimental": {
                 "clash_api": {
@@ -4486,6 +5308,53 @@ class App(QWidget):
         }
         if route:
             config["route"] = route
+
+        if tun_enabled:
+            config["inbounds"].append(
+                {
+                    "type": "tun",
+                    "tag": "tun-in",
+                    "address": ["172.19.0.1/30"],
+                    "auto_route": True,
+                    "strict_route": False,
+                    "stack": "gvisor",
+                    "route_exclude_address": tun_route_exclude,
+                    "sniff": True,
+                    "sniff_override_destination": True,
+                }
+            )
+            if "route" not in config:
+                config["route"] = {"auto_detect_interface": True}
+            elif isinstance(config["route"], dict):
+                config["route"].setdefault("auto_detect_interface", True)
+            # Ensure DNS works in TUN mode (avoid relying on system DNS)
+            primary_dns = _primary_dns(self.current_dns_ip or "8.8.8.8")
+            config["dns"] = {
+                "servers": [
+                    {
+                        "tag": "dns-primary",
+                        "address": primary_dns,
+                        "detour": "direct",
+                    },
+                    {
+                        "tag": "dns-fallback",
+                        "address": "1.1.1.1",
+                        "detour": "direct",
+                    }
+                ],
+                "final": "dns-primary",
+                "strategy": "prefer_ipv4",
+            }
+        else:
+            config["inbounds"].append(
+                {
+                    "type": "mixed",
+                    "listen": listen_ip,
+                    "listen_port": int(self.mixed_port_input.value()),
+                    "sniff": True,
+                    "sniff_override_destination": True,
+                }
+            )
 
         cfg_path = config_path(RUNTIME_CONFIG_NAME)
         with open(cfg_path, "w", encoding="utf-8") as f:
@@ -4509,7 +5378,10 @@ class App(QWidget):
             self.reconnect_attempts = 0
             active_txt = self._format_active_proxy_display(self.current_dns_ip, self.current_domain)
             suffix = f" | {active_txt}" if active_txt else ""
-            self.set_status(f"CONNECTED | Mixed: {listen_ip}:{self.mixed_port_input.value()}{suffix}")
+            if tun_enabled:
+                self.set_status(f"CONNECTED | TUN: on{suffix}")
+            else:
+                self.set_status(f"CONNECTED | Mixed: {listen_ip}:{self.mixed_port_input.value()}{suffix}")
             if lan_mode:
                 ip = self.get_lan_ip()
                 self.emitter.log.emit("INFO", f"LAN Mode enabled. Phone proxy => {ip}:{self.mixed_port_input.value()}")
@@ -4523,6 +5395,9 @@ class App(QWidget):
             threading.Timer(2.0, _start_tm).start()
         except FileNotFoundError:
             self.emitter.log.emit("ERROR", "sing-box.exe not found.")
+            self.stop_connection()
+        except Exception as e:
+            self.emitter.log.emit("ERROR", f"Failed to start sing-box: {e}")
             self.stop_connection()
 
     def stop_connection(self) -> None:
@@ -4539,6 +5414,10 @@ class App(QWidget):
         self.current_proxy_password = ""
         self.reconnect_attempts = 0
         self.graceful_stop = False
+        self._health_failures = 0
+        self._health_grace_until_ts = 0.0
+        self._health_start_ts = 0.0
+        self._health_last_ok_ts = 0.0
         self.set_status("Stopped")
         self.connect_btn.setText("🚀 CONNECT (Slipstream)")
         self.connect_btn.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; padding: 12px;")
@@ -4562,9 +5441,11 @@ class App(QWidget):
                 except Exception:
                     pass
         if os.name == "nt":
-            taskkill_names([SLIPSTREAM_BIN, SINGBOX_BIN])
+            taskkill_names(["slipstream-client-windows-amd64.exe", "dnstt-client-windows-amd64.exe", "sing-box.exe"])
         self.proc_tunnel = None
         self.proc_singbox = None
+        self._health_failures = 0
+        self._health_last_ok_ts = 0.0
 
     # --- reconnect monitor ---
     def cancel_reconnect_timer(self) -> None:
@@ -4600,6 +5481,50 @@ class App(QWidget):
                 reason = "Tunnel process stopped unexpectedly." if tunnel_dead else "Proxy core stopped unexpectedly."
                 self.emitter.connection_drop.emit(reason)
                 break
+
+            # Health probe: if sing-box is up but cannot connect to the tunnel SOCKS port, recover automatically.
+            # This catches the common case: tunnel stuck/died but process still exists (or was replaced) and
+            # sing-box keeps logging "connectex: actively refused".
+            if self.reconnecting or self.graceful_stop:
+                continue
+            if time.time() < float(getattr(self, "_health_grace_until_ts", 0.0)):
+                continue
+
+            try:
+                port = int(getattr(self, "internal_port", 0) or 0)
+            except Exception:
+                port = 0
+            if port <= 0:
+                continue
+
+            ok = self._probe_tcp_port("127.0.0.1", port, timeout=0.35)
+            if ok:
+                self._health_failures = 0
+                self._health_last_ok_ts = time.time()
+                continue
+
+            self._health_failures += 1
+            if self._health_failures >= 3:
+                self.emitter.connection_drop.emit(
+                    f"Tunnel SOCKS listener is down (127.0.0.1:{port} refused). Forcing reconnect..."
+                )
+                break
+
+    @staticmethod
+    def _probe_tcp_port(host: str, port: int, *, timeout: float = 0.5) -> bool:
+        """Best-effort check whether a local TCP listener is accepting connections."""
+        s: Optional[socket.socket] = None
+        try:
+            s = socket.create_connection((host, int(port)), timeout=timeout)
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                if s:
+                    s.close()
+            except Exception:
+                pass
 
     def handle_connection_drop(self, reason: str) -> None:
         if not self.running:
@@ -4654,6 +5579,9 @@ class App(QWidget):
                         self.slipstream_ready_event.set()
                     if "Server certificate pinning is disabled" in msg:
                         continue
+                if tag == "DNSTT":
+                    # DNSTT readiness is detected via SOCKS probe, keep logs only.
+                    pass
                 low = msg.lower()
                 lvl = "DEBUG"
                 if "forcibly closed" in low or "closed" in low:
@@ -4746,14 +5674,15 @@ class App(QWidget):
 
 
 if __name__ == "__main__":
-    try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
-    except Exception:
-        pass
-
-    if sys.platform == "linux":
-        # Force X11 backend to avoid Wayland/Input Method segfaults on some distros
+    if sys.platform == "linux" and not os.environ.get("QT_QPA_PLATFORM"):
+        # Helps avoid some Linux Qt crashes on certain distros/WM combos.
         os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+    if ctypes and os.name == "nt":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     app = QApplication(sys.argv)
     shared = QSharedMemory(APP_ID)
@@ -4783,16 +5712,17 @@ if __name__ == "__main__":
     w = App()
     w.show()
 
-    # Allow Ctrl+C to close the app
     def signal_handler(sig, frame):
-        print("\nCtrl+C caught. Exiting...")
-        w.close_app()
+        try:
+            w.close_app()
+        except Exception:
+            try:
+                QApplication.quit()
+            except Exception:
+                pass
 
-    signal.signal(signal.SIGINT, signal_handler)
-
-    # Timer to let Python interpreter run periodically to catch signals
-    timer = QTimer()
-    timer.start(200)
-    timer.timeout.connect(lambda: None)
-
+    try:
+        signal.signal(signal.SIGINT, signal_handler)
+    except Exception:
+        pass
     sys.exit(app.exec())

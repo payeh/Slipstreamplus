@@ -16,12 +16,18 @@
 - 📶 LAN Mode برای اشتراک پروکسی با گوشی روی همان شبکه
 - 🔄 اتصال خودکار مجدد
 - 📊 نمایش ترافیک (اختیاری با `websocket-client`)
+- 🧬 پروتکل‌های تونل: `SLIPSTREAM` و `DNSTT`
+
+## 🆕 تغییرات نسخه جدید
+**v1.1.0 (2026-03-03)**
+- مشکل «وصل است ولی کار نمی‌کند» رفع شد: یک Health Monitor اضافه شد که اگر SOCKS داخلی تونل روی `127.0.0.1:<port>` از کار بیفتد/Refuse بدهد، برنامه خودش Auto-Reconnect می‌کند و دیگر نیاز به Disconnect دستی نیست.
 
 ## ✅ پیش‌نیازها
 - ویندوز 10/11
 - فایل‌های باینری در `bin/`
   - `sing-box.exe`
   - `slipstream-client-windows-amd64.exe`
+  - `dnstt-client-windows-amd64.exe` (برای DNSTT)
   - `libcrypto-3-x64.dll` و `libssl-3-x64.dll`
 - Python 3.10+ (اگر از سورس اجرا می‌کنید)
 - پکیج‌ها: `PySide6` (اجباری)، `websocket-client` (اختیاری)
@@ -56,6 +62,11 @@ SLIPSTREAM://s.example.com:53?dns=1.2.3.4#My%20Server
 نمونه با یوزرنیم/پسورد و چند DNS:
 ```
 SLIPSTREAM://user:pass@s.example.com:53?dns=8.8.8.8,1.1.1.1,9.9.9.9#My%20Server
+```
+
+**فرمت لینک DNSTT**
+```
+DNSTT:////<PUBLIC_KEY_HEX>@<DOMAIN>:53?dns=<DNS_IP>#<REMARKS>
 ```
 
 **مودها**
@@ -102,7 +113,7 @@ SLIPSTREAM://user:pass@s.example.com:53?dns=8.8.8.8,1.1.1.1,9.9.9.9#My%20Server
 
 ## 🧱 ساخت خروجی (PyInstaller)
 ```bash
-pyinstaller Slipstreamplus.spec
+pyinstaller --noconsole --onefile --icon="icon.ico" --add-data "icon.ico;." --add-data "asset;asset" --add-data "geo;geo" Slipstreamplus.py
 ```
 
 ## 🛠️ رفع مشکل‌های رایج

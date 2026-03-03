@@ -1,1 +1,11 @@
 config/
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec
+Slipstreamplus.exe
+bin/sing-box*
+bin/slipstream-client-*
+bin/dnstt-client-*
+bin/wintun*.dll
