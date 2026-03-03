@@ -19,6 +19,10 @@ A Windows desktop app that scans and tests clean DNS endpoints, connects to Slip
 - 🧬 Tunnel protocols: `SLIPSTREAM` and `DNSTT`
 
 ## 🆕 Changelog (Latest)
+**v1.1.2 (2026-03-03)**
+- Windows release includes `dnstt-client` and `wintun.dll` as separate release assets (and inside the ZIP).
+- Windows build uses `icon.ico` and also ships it next to the executable.
+
 **v1.1.1 (2026-03-03)**
 - Release packaging: `bin/`, `asset/`, `geo/`, `cidrs/` are shipped next to the executable (not embedded).
 - DNSTT links standardized to `DNSTT://...` (2 slashes).
