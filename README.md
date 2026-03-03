@@ -19,6 +19,9 @@ A Windows desktop app that scans and tests clean DNS endpoints, connects to Slip
 - 🧬 Tunnel protocols: `SLIPSTREAM` and `DNSTT`
 
 ## 🆕 Changelog (Latest)
+**v1.1.5 (2026-03-03)**
+- Auto reconnect: improved health detection by probing the internal SOCKS5 listener (supports auth), and use a fixed retry delay.
+
 **v1.1.4 (2026-03-03)**
 - CI: fixed Windows PowerShell quoting in “Stage Runtime Folders” step.
 

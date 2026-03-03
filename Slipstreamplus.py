@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.4"
+APP_VERSION = "v1.1.5"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -5498,7 +5498,13 @@ class App(QWidget):
             if port <= 0:
                 continue
 
-            ok = self._probe_tcp_port("127.0.0.1", port, timeout=0.35)
+            ok = self._probe_socks5_listener(
+                "127.0.0.1",
+                port,
+                timeout=0.8,
+                username=str(getattr(self, "current_proxy_username", "") or ""),
+                password=str(getattr(self, "current_proxy_password", "") or ""),
+            )
             if ok:
                 self._health_failures = 0
                 self._health_last_ok_ts = time.time()
@@ -5512,12 +5518,42 @@ class App(QWidget):
                 break
 
     @staticmethod
-    def _probe_tcp_port(host: str, port: int, *, timeout: float = 0.5) -> bool:
-        """Best-effort check whether a local TCP listener is accepting connections."""
+    def _probe_socks5_listener(
+        host: str,
+        port: int,
+        *,
+        timeout: float = 1.0,
+        username: str = "",
+        password: str = "",
+    ) -> bool:
+        """Probe that a local SOCKS5 listener is actually responsive (not just bound).
+
+        Accepts no-auth (0x00) and username/password (0x02). If server selects 0x02,
+        we must have credentials to complete auth.
+        """
         s: Optional[socket.socket] = None
         try:
             s = socket.create_connection((host, int(port)), timeout=timeout)
-            return True
+            s.settimeout(timeout)
+
+            methods = [0x00, 0x02]  # no-auth + username/password
+            s.sendall(bytes([0x05, len(methods), *methods]))
+            resp = s.recv(2)
+            if len(resp) != 2 or resp[0] != 0x05:
+                return False
+            method = resp[1]
+            if method == 0x00:
+                return True
+            if method != 0x02:
+                return False
+
+            u = (username or "").encode("utf-8", errors="ignore")
+            p = (password or "").encode("utf-8", errors="ignore")
+            if not u or not p or len(u) > 255 or len(p) > 255:
+                return False
+            s.sendall(bytes([0x01, len(u)]) + u + bytes([len(p)]) + p)
+            aresp = s.recv(2)
+            return len(aresp) == 2 and aresp[0] == 0x01 and aresp[1] == 0x00
         except Exception:
             return False
         finally:
@@ -5561,7 +5597,8 @@ class App(QWidget):
         self.force_stop()
         self.graceful_stop = False
 
-        delay = min(5, self.reconnect_attempts * 2)
+        # Match SlipNet behavior: fixed 3s retry delay (up to max attempts).
+        delay = 3
         self.cancel_reconnect_timer()
         self.reconnect_timer = threading.Timer(delay, lambda: self.start_connection(self.current_dns_ip, is_reconnect=True))
         self.reconnect_timer.start()
