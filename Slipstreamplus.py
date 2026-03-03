@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.5"
+APP_VERSION = "v1.1.6"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -784,6 +784,9 @@ class App(QWidget):
         self._health_grace_until_ts = 0.0
         self._health_start_ts = 0.0
         self._health_last_ok_ts = 0.0
+        self._tunnel_restart_in_progress = False
+        self._tunnel_restart_count = 0
+        self._tunnel_restart_last_ts = 0.0
 
         # scanner
         self.scan_running = False
@@ -5419,6 +5422,9 @@ class App(QWidget):
         self._health_grace_until_ts = 0.0
         self._health_start_ts = 0.0
         self._health_last_ok_ts = 0.0
+        self._tunnel_restart_in_progress = False
+        self._tunnel_restart_count = 0
+        self._tunnel_restart_last_ts = 0.0
         self.set_status("Stopped")
         self.connect_btn.setText("🚀 CONNECT (Slipstream)")
         self.connect_btn.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; padding: 12px;")
@@ -5512,10 +5518,60 @@ class App(QWidget):
 
             self._health_failures += 1
             if self._health_failures >= 3:
+                # First try to restart the tunnel process only (keep sing-box running and keep ports stable).
+                # If that keeps failing, fall back to full reconnect.
+                if self._restart_tunnel_only(f"SOCKS down on 127.0.0.1:{port}"):
+                    self._health_failures = 0
+                    self._health_grace_until_ts = time.time() + 10.0
+                    continue
+
                 self.emitter.connection_drop.emit(
                     f"Tunnel SOCKS listener is down (127.0.0.1:{port} refused). Forcing reconnect..."
                 )
                 break
+
+    def _restart_tunnel_only(self, reason: str) -> bool:
+        """Restart only the tunnel process (slipstream/dnstt) while keeping sing-box alive."""
+        if not self.running or self.reconnecting or self.graceful_stop:
+            return False
+        if self._tunnel_restart_in_progress:
+            return False
+
+        now = time.time()
+        # Basic throttling: avoid rapid restart loops.
+        if now - float(getattr(self, "_tunnel_restart_last_ts", 0.0)) < 8.0:
+            return False
+        if int(getattr(self, "_tunnel_restart_count", 0) or 0) >= 3:
+            return False
+        if not self.current_dns_ip or not self.current_domain:
+            return False
+
+        self._tunnel_restart_in_progress = True
+        self._tunnel_restart_last_ts = now
+        self._tunnel_restart_count = int(getattr(self, "_tunnel_restart_count", 0) or 0) + 1
+        self.emitter.log.emit("WARN", f"Proxy: tunnel restart ({self._tunnel_restart_count}/3) - {reason}")
+
+        def _do():
+            try:
+                # Stop tunnel process only (do not kill sing-box).
+                if self.proc_tunnel:
+                    try:
+                        if self.proc_tunnel.poll() is None:
+                            interrupt_process(self.proc_tunnel)
+                            self.proc_tunnel.wait(timeout=2)
+                    except Exception:
+                        pass
+                if os.name == "nt":
+                    # Make sure no stale tunnel is holding the port.
+                    taskkill_names(["slipstream-client-windows-amd64.exe", "dnstt-client-windows-amd64.exe"])
+                self.proc_tunnel = None
+                # Re-spawn tunnel using existing internal_port (sing-box outbound points here).
+                self.spawn_tunnel(self.current_dns_ip, self.current_domain)
+            finally:
+                self._tunnel_restart_in_progress = False
+
+        threading.Thread(target=_do, daemon=True).start()
+        return True
 
     @staticmethod
     def _probe_socks5_listener(
