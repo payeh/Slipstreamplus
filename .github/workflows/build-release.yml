@@ -62,10 +62,25 @@ jobs:
           # Download Wintun (for TUN mode)
           Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile "wintun.zip"
           Expand-Archive -Force "wintun.zip" "wintun-tmp"
-          $wintun = Get-ChildItem -Path "wintun-tmp" -Recurse -Filter "wintun.dll" | Where-Object { $_.FullName -match \"amd64\" } | Select-Object -First 1
-          if ($wintun) { Copy-Item -Force $wintun.FullName \"bin/wintun.dll\" }
-          Remove-Item -Force \"wintun.zip\"
-          Remove-Item -Recurse -Force \"wintun-tmp\"
+
+          # Prefer the well-known path from the official archive:
+          # wintun/bin/amd64/wintun.dll
+          $preferred = @(
+            "wintun-tmp\\wintun\\bin\\amd64\\wintun.dll",
+            "wintun-tmp\\bin\\amd64\\wintun.dll"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if ($preferred) {
+            Copy-Item -Force $preferred "bin\\wintun.dll"
+          } else {
+            $wintun = Get-ChildItem -Path "wintun-tmp" -Recurse -Filter "wintun.dll" |
+              Where-Object { $_.FullName -match 'amd64' } |
+              Select-Object -First 1
+            if ($wintun) { Copy-Item -Force $wintun.FullName "bin\\wintun.dll" }
+          }
+
+          Remove-Item -Force "wintun.zip"
+          Remove-Item -Recurse -Force "wintun-tmp"
           
           dir bin
 
