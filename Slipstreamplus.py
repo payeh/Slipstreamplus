@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.8"
+APP_VERSION = "v1.1.9"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -987,12 +987,19 @@ class App(QWidget):
         if hasattr(self, "update_status_lbl"):
             self.update_status_lbl.setText("Checking for updates...")
 
+        def _http_get(url: str, timeout: float = 15.0) -> bytes:
+            # If connected, tunnel the update check through internal SOCKS5.
+            if self.running or self.reconnecting:
+                return self._http_get_via_socks(url, timeout=timeout)
+            req = urllib.request.Request(url, headers={"User-Agent": "SlipstreamPlus"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+
         def _worker():
             url = "https://api.github.com/repos/payeh/Slipstreamplus/releases/latest"
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "SlipstreamPlus"})
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                raw = _http_get(url, timeout=15)
+                data = json.loads(raw.decode("utf-8", errors="ignore"))
                 tag = str(data.get("tag_name", "") or "")
                 assets = data.get("assets", []) or []
                 latest = {"tag": tag, "assets": assets}
@@ -1064,11 +1071,20 @@ class App(QWidget):
         if hasattr(self, "update_status_lbl"):
             self.update_status_lbl.setText("Downloading update...")
 
+        def _download(url: str, out_path: str) -> None:
+            if self.running or self.reconnecting:
+                data = self._http_get_via_socks(url, timeout=60)
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                with open(out_path, "wb") as f:
+                    f.write(data)
+                return
+            _download_to_file(url, out_path, timeout=60)
+
         def _worker():
             try:
                 tmp_dir = tempfile.mkdtemp(prefix="slipupdate_")
                 zip_path = os.path.join(tmp_dir, "update.zip")
-                _download_to_file(url, zip_path, timeout=60)
+                _download(url, zip_path)
 
                 extract_dir = os.path.join(tmp_dir, "extract")
                 os.makedirs(extract_dir, exist_ok=True)
@@ -1124,6 +1140,86 @@ class App(QWidget):
                 QTimer.singleShot(0, _fail)
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _http_get_via_socks(self, url: str, timeout: float = 15.0) -> bytes:
+        """Minimal HTTPS GET over local SOCKS5 (for update checks/downloads)."""
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        if not host:
+            raise RuntimeError("Invalid update URL")
+
+        proxy_port = int(getattr(self, "internal_port", 0) or 0)
+        if proxy_port <= 0:
+            raise RuntimeError("Proxy port not ready")
+
+        # SOCKS5 connect to host:port
+        sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=timeout)
+        sock.settimeout(timeout)
+        try:
+            # Auth methods
+            methods = [0x00, 0x02]
+            sock.sendall(bytes([0x05, len(methods), *methods]))
+            resp = sock.recv(2)
+            if len(resp) != 2 or resp[0] != 0x05:
+                raise RuntimeError("SOCKS5 handshake failed")
+            if resp[1] == 0x02:
+                u = (self.current_proxy_username or "").encode("utf-8", errors="ignore")
+                p = (self.current_proxy_password or "").encode("utf-8", errors="ignore")
+                if not u or not p or len(u) > 255 or len(p) > 255:
+                    raise RuntimeError("SOCKS5 auth required but credentials missing")
+                sock.sendall(bytes([0x01, len(u)]) + u + bytes([len(p)]) + p)
+                aresp = sock.recv(2)
+                if len(aresp) != 2 or aresp[1] != 0x00:
+                    raise RuntimeError("SOCKS5 auth failed")
+            elif resp[1] != 0x00:
+                raise RuntimeError("SOCKS5 auth method unsupported")
+
+            host_bytes = host.encode("utf-8")
+            req = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + int(port).to_bytes(2, "big")
+            sock.sendall(req)
+            resp = sock.recv(4)
+            if len(resp) < 2 or resp[1] != 0x00:
+                raise RuntimeError("SOCKS5 connect failed")
+            # Drain remaining bind addr/port if present
+            if len(resp) < 10:
+                sock.recv(10 - len(resp))
+
+            if parsed.scheme == "https":
+                ctx = ssl.create_default_context()
+                conn = ctx.wrap_socket(sock, server_hostname=host)
+            else:
+                conn = sock
+
+            http_req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                "User-Agent: SlipstreamPlus\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("utf-8")
+            conn.sendall(http_req)
+            chunks = []
+            while True:
+                data = conn.recv(8192)
+                if not data:
+                    break
+                chunks.append(data)
+            raw = b"".join(chunks)
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        # Very small HTTP parsing: split headers/body
+        header_end = raw.find(b"\r\n\r\n")
+        if header_end == -1:
+            return raw
+        body = raw[header_end + 4 :]
+        return body
 
     # ================= UI =================
     def build_ui(self) -> None:
@@ -1229,7 +1325,7 @@ class App(QWidget):
         self.auto_reconnect_chk_proxy.setChecked(bool(self.config.get("auto_reconnect", True)))
         self.auto_reconnect_chk_proxy.stateChanged.connect(self.on_auto_reconnect_changed)
 
-        self.tun_mode_chk_proxy = QCheckBox("TUN")
+        self.tun_mode_chk_proxy = QCheckBox("TUN Mode")
         self.tun_mode_chk_proxy.setChecked(bool(self.config.get("tun_mode", False)))
         self.tun_mode_chk_proxy.stateChanged.connect(self.on_tun_mode_changed)
 
@@ -1479,7 +1575,7 @@ class App(QWidget):
         self.auto_reconnect_chk.setChecked(bool(self.config.get("auto_reconnect", True)))
         self.auto_reconnect_chk.stateChanged.connect(self.on_auto_reconnect_changed)
 
-        self.tun_mode_chk = QCheckBox("TUN")
+        self.tun_mode_chk = QCheckBox("TUN Mode")
         self.tun_mode_chk.setChecked(bool(self.config.get("tun_mode", False)))
         self.tun_mode_chk.stateChanged.connect(self.on_tun_mode_changed)
 
@@ -3268,6 +3364,7 @@ class App(QWidget):
             "DNSTT",
             "SING-BOX",
             "TUN",
+            "Tunnel process",
             "Hotspot Mode",
         )
         connect_tags = ("CONNECT", "System Proxy", "Auto reconnect", "LAN Mode")
@@ -5211,6 +5308,12 @@ class App(QWidget):
         else:
             self.running = True
             self.reconnecting = True
+        # TUN toggle allowed only when disconnected
+        try:
+            self.tun_mode_chk.setEnabled(False)
+            self.tun_mode_chk_proxy.setEnabled(False)
+        except Exception:
+            pass
 
         self.current_dns_ip = target_ip
         self.current_domain = domain
@@ -5720,6 +5823,12 @@ class App(QWidget):
         self._tunnel_restart_count = 0
         self._tunnel_restart_last_ts = 0.0
         self.set_status("Stopped")
+        # TUN toggle allowed only when disconnected
+        try:
+            self.tun_mode_chk.setEnabled(True)
+            self.tun_mode_chk_proxy.setEnabled(True)
+        except Exception:
+            pass
         self.connect_btn.setText("🚀 CONNECT (Slipstream)")
         self.connect_btn.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; padding: 12px;")
         if hasattr(self, "proxy_connect_btn"):
