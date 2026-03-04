@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.10"
+APP_VERSION = "v1.1.11"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -987,6 +987,8 @@ class App(QWidget):
         if hasattr(self, "update_status_lbl"):
             self.update_status_lbl.setText("Checking for updates...")
 
+        done = threading.Event()
+
         def _http_get(url: str, timeout: float = 15.0) -> bytes:
             # If connected, tunnel the update check through internal SOCKS5.
             if self.running or self.reconnecting:
@@ -1007,6 +1009,7 @@ class App(QWidget):
                 latest = {"error": str(e)}
 
             def _apply():
+                done.set()
                 if hasattr(self, "btn_check_update"):
                     self.btn_check_update.setEnabled(True)
                 err = latest.get("error")
@@ -1031,6 +1034,17 @@ class App(QWidget):
             QTimer.singleShot(0, _apply)
 
         threading.Thread(target=_worker, daemon=True).start()
+
+        def _timeout():
+            if done.is_set():
+                return
+            done.set()
+            if hasattr(self, "btn_check_update"):
+                self.btn_check_update.setEnabled(True)
+            if hasattr(self, "update_status_lbl"):
+                self.update_status_lbl.setText("Update check timed out.")
+
+        QTimer.singleShot(20000, _timeout)
 
     def start_update_download(self) -> None:
         if not self._latest_release_info:
@@ -5394,7 +5408,9 @@ class App(QWidget):
             self.proxy_connect_btn.setText("DISCONNECT")
             self.proxy_connect_btn.setStyleSheet("background-color: #c62828; color: white; font-weight: bold; padding: 6px 12px;")
 
-        self.update_traffic_labels("0.00 B/s", "0.00 B/s", "0.00 B", "0.00 B")
+        # Only reset totals on manual connect, not during auto-reconnect.
+        if not is_reconnect:
+            self.update_traffic_labels("0.00 B/s", "0.00 B/s", "0.00 B", "0.00 B")
 
         singbox_not_running = (not self.proc_singbox or self.proc_singbox.poll() is not None)
 
