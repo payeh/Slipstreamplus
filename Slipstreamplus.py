@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.13"
+APP_VERSION = "v1.1.14"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -3430,6 +3430,8 @@ class App(QWidget):
             "SING-BOX",
             "TUN",
             "Tunnel process",
+            "Tunnel SOCKS",
+            "SOCKS listener",
             "Hotspot Mode",
         )
         connect_tags = ("CONNECT", "System Proxy", "Auto reconnect", "LAN Mode")
@@ -5990,7 +5992,7 @@ class App(QWidget):
             if self._health_failures >= 3:
                 # First try to restart the tunnel process only (keep sing-box running and keep ports stable).
                 # If that keeps failing, fall back to full reconnect.
-                if self._restart_tunnel_only(f"SOCKS down on 127.0.0.1:{port}"):
+                if self._restart_tunnel_only_for_health(f"SOCKS down on 127.0.0.1:{port}"):
                     self._health_failures = 0
                     self._health_grace_until_ts = time.time() + 10.0
                     continue
@@ -6000,7 +6002,7 @@ class App(QWidget):
                 )
                 break
 
-    def _restart_tunnel_only(self, reason: str) -> bool:
+    def _restart_tunnel_only_for_health(self, reason: str) -> bool:
         """Restart only the tunnel process (slipstream/dnstt) while keeping sing-box alive."""
         if not self.running or self.reconnecting or self.graceful_stop:
             return False
