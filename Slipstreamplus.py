@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.7"
+APP_VERSION = "v1.1.8"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -829,6 +829,7 @@ class App(QWidget):
         self._proxy_edit_guard = False
         self._imported_dns_list: List[str] = []
         self._loading_proxy_rows = False
+        self._latest_release_info: Optional[Dict[str, object]] = None
 
         # signals
         self.emitter = Emitter()
@@ -961,6 +962,169 @@ class App(QWidget):
         buttons.rejected.connect(dlg.reject)
         dlg.exec()
 
+    # ================= Update =================
+    @staticmethod
+    def _parse_version(ver: str) -> Tuple[int, int, int]:
+        v = (ver or "").strip().lower()
+        if v.startswith("v"):
+            v = v[1:]
+        parts = v.split(".")
+        nums = []
+        for p in parts[:3]:
+            try:
+                nums.append(int(p))
+            except Exception:
+                nums.append(0)
+        while len(nums) < 3:
+            nums.append(0)
+        return tuple(nums)  # type: ignore[return-value]
+
+    def check_for_updates(self, manual: bool = False) -> None:
+        if hasattr(self, "btn_check_update"):
+            self.btn_check_update.setEnabled(False)
+        if hasattr(self, "btn_start_update"):
+            self.btn_start_update.setEnabled(False)
+        if hasattr(self, "update_status_lbl"):
+            self.update_status_lbl.setText("Checking for updates...")
+
+        def _worker():
+            url = "https://api.github.com/repos/payeh/Slipstreamplus/releases/latest"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "SlipstreamPlus"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                tag = str(data.get("tag_name", "") or "")
+                assets = data.get("assets", []) or []
+                latest = {"tag": tag, "assets": assets}
+            except Exception as e:
+                latest = {"error": str(e)}
+
+            def _apply():
+                if hasattr(self, "btn_check_update"):
+                    self.btn_check_update.setEnabled(True)
+                err = latest.get("error")
+                if err:
+                    if hasattr(self, "update_status_lbl"):
+                        self.update_status_lbl.setText(f"Update check failed: {err}")
+                    return
+                self._latest_release_info = latest
+                current = self._parse_version(APP_VERSION)
+                newest = self._parse_version(str(latest.get("tag", "")))
+                if newest > current:
+                    if hasattr(self, "update_status_lbl"):
+                        self.update_status_lbl.setText(f"New version available: {latest.get('tag')}")
+                    if hasattr(self, "btn_start_update"):
+                        self.btn_start_update.setEnabled(True)
+                else:
+                    if hasattr(self, "update_status_lbl"):
+                        self.update_status_lbl.setText("You are up to date.")
+                    if hasattr(self, "btn_start_update"):
+                        self.btn_start_update.setEnabled(False)
+
+            QTimer.singleShot(0, _apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def start_update_download(self) -> None:
+        if not self._latest_release_info:
+            self.check_for_updates(manual=True)
+            return
+        tag = str(self._latest_release_info.get("tag", "") or "")
+        assets = list(self._latest_release_info.get("assets", []) or [])
+        if not tag or not assets:
+            if hasattr(self, "update_status_lbl"):
+                self.update_status_lbl.setText("No update assets found.")
+            return
+
+        if not getattr(sys, "frozen", False):
+            if hasattr(self, "update_status_lbl"):
+                self.update_status_lbl.setText("Auto-update is available only for the packaged EXE.")
+            return
+
+        # Find Windows zip asset
+        asset = None
+        for a in assets:
+            name = str(a.get("name", "") or "")
+            if name.endswith("windows-amd64.zip"):
+                asset = a
+                break
+        if not asset:
+            if hasattr(self, "update_status_lbl"):
+                self.update_status_lbl.setText("Windows update package not found in release assets.")
+            return
+
+        url = str(asset.get("browser_download_url", "") or "")
+        if not url:
+            if hasattr(self, "update_status_lbl"):
+                self.update_status_lbl.setText("Update download URL is missing.")
+            return
+
+        if hasattr(self, "btn_start_update"):
+            self.btn_start_update.setEnabled(False)
+        if hasattr(self, "update_status_lbl"):
+            self.update_status_lbl.setText("Downloading update...")
+
+        def _worker():
+            try:
+                tmp_dir = tempfile.mkdtemp(prefix="slipupdate_")
+                zip_path = os.path.join(tmp_dir, "update.zip")
+                _download_to_file(url, zip_path, timeout=60)
+
+                extract_dir = os.path.join(tmp_dir, "extract")
+                os.makedirs(extract_dir, exist_ok=True)
+                with zipfile.ZipFile(zip_path, "r") as z:
+                    z.extractall(extract_dir)
+
+                # Find folder containing the EXE
+                exe_name = os.path.basename(sys.executable)
+                candidate = None
+                for root, _, files in os.walk(extract_dir):
+                    if exe_name in files:
+                        candidate = root
+                        break
+                if not candidate:
+                    # fallback: any .exe
+                    for root, _, files in os.walk(extract_dir):
+                        for f in files:
+                            if f.lower().endswith(".exe"):
+                                candidate = root
+                                exe_name = f
+                                break
+                        if candidate:
+                            break
+
+                if not candidate:
+                    raise RuntimeError("Update package does not contain executable.")
+
+                app_dir = os.path.dirname(sys.executable)
+                updater_bat = os.path.join(tmp_dir, "update.bat")
+                with open(updater_bat, "w", encoding="utf-8") as f:
+                    f.write("@echo off\n")
+                    f.write("timeout /t 2 /nobreak >nul\n")
+                    f.write(f"xcopy /E /Y /I \"{candidate}\\*\" \"{app_dir}\\\" >nul\n")
+                    f.write(f"start \"\" \"{os.path.join(app_dir, exe_name)}\"\n")
+
+                subprocess.Popen(
+                    ["cmd", "/c", "start", "", updater_bat],
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+
+                def _apply():
+                    if hasattr(self, "update_status_lbl"):
+                        self.update_status_lbl.setText("Update installed. Restarting...")
+                    self.close_app()
+
+                QTimer.singleShot(0, _apply)
+            except Exception as e:
+                def _fail():
+                    if hasattr(self, "update_status_lbl"):
+                        self.update_status_lbl.setText(f"Update failed: {e}")
+                    if hasattr(self, "btn_start_update"):
+                        self.btn_start_update.setEnabled(True)
+                QTimer.singleShot(0, _fail)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     # ================= UI =================
     def build_ui(self) -> None:
         self.tabs = QTabWidget()
@@ -1065,7 +1229,7 @@ class App(QWidget):
         self.auto_reconnect_chk_proxy.setChecked(bool(self.config.get("auto_reconnect", True)))
         self.auto_reconnect_chk_proxy.stateChanged.connect(self.on_auto_reconnect_changed)
 
-        self.tun_mode_chk_proxy = QCheckBox("TUN Mode (Wintun)")
+        self.tun_mode_chk_proxy = QCheckBox("TUN")
         self.tun_mode_chk_proxy.setChecked(bool(self.config.get("tun_mode", False)))
         self.tun_mode_chk_proxy.stateChanged.connect(self.on_tun_mode_changed)
 
@@ -1238,6 +1402,27 @@ class App(QWidget):
         self.tabs.addTab(scan_tab, "Scanner")
         self.on_scan_realtest_changed()
 
+        # --- Update tab ---
+        update_tab = QWidget()
+        update_layout = QVBoxLayout(update_tab)
+        update_layout.setContentsMargins(20, 20, 20, 20)
+
+        self.update_status_lbl = QLabel("Check for updates to see if a newer version is available.")
+        self.update_status_lbl.setStyleSheet("font-size: 12px;")
+        self.btn_check_update = QPushButton("Check for Updates")
+        self.btn_check_update.clicked.connect(lambda: self.check_for_updates(manual=True))
+        self.btn_start_update = QPushButton("Update Now")
+        self.btn_start_update.setEnabled(False)
+        self.btn_start_update.clicked.connect(self.start_update_download)
+
+        update_layout.addWidget(self.update_status_lbl)
+        update_layout.addSpacing(8)
+        update_layout.addWidget(self.btn_check_update)
+        update_layout.addWidget(self.btn_start_update)
+        update_layout.addStretch()
+
+        self.tabs.addTab(update_tab, "Update")
+
         # --- About tab ---
         about_tab = QWidget()
         about_layout = QVBoxLayout(about_tab)
@@ -1294,7 +1479,7 @@ class App(QWidget):
         self.auto_reconnect_chk.setChecked(bool(self.config.get("auto_reconnect", True)))
         self.auto_reconnect_chk.stateChanged.connect(self.on_auto_reconnect_changed)
 
-        self.tun_mode_chk = QCheckBox("TUN Mode")
+        self.tun_mode_chk = QCheckBox("TUN")
         self.tun_mode_chk.setChecked(bool(self.config.get("tun_mode", False)))
         self.tun_mode_chk.stateChanged.connect(self.on_tun_mode_changed)
 
@@ -1827,7 +2012,7 @@ class App(QWidget):
         type_edit.addItems(["SLIPSTREAM", "DNSTT"])
         type_edit.setCurrentText("SLIPSTREAM")
         remarks_edit = QLineEdit("")
-        auth_enable_chk = QCheckBox("Enable username/password")
+        auth_enable_chk = QCheckBox("Enable SOCKS5 AUTH")
         auth_enable_chk.setChecked(False)
         username_edit = QLineEdit("")
         password_edit = QLineEdit("")
@@ -2026,7 +2211,7 @@ class App(QWidget):
         current_type_norm = (current_type or "SLIPSTREAM").strip().upper()
         type_edit.setCurrentText("DNSTT" if current_type_norm == "DNSTT" else "SLIPSTREAM")
         remarks_edit = QLineEdit(current_remarks)
-        auth_enable_chk = QCheckBox("Enable username/password")
+        auth_enable_chk = QCheckBox("Enable SOCKS5 AUTH")
         auth_enable_chk.setChecked(bool(current_username and current_password))
         username_edit = QLineEdit(current_username)
         password_edit = QLineEdit(current_password)
@@ -3106,6 +3291,9 @@ class App(QWidget):
                 pass
         else:
             try:
+                if self.proxy_log_box.document().blockCount() >= 100:
+                    self.proxy_log_box.clear()
+                    self.proxy_log_box.append("========= AUTO CLEAR =============")
                 self.proxy_log_box.append(line)
                 sb3 = self.proxy_log_box.verticalScrollBar()
                 sb3.setValue(sb3.maximum())
