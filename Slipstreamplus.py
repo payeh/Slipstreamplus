@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.14"
+APP_VERSION = "v1.1.15"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -986,6 +986,8 @@ class App(QWidget):
             self.btn_start_update.setEnabled(False)
         if hasattr(self, "update_status_lbl"):
             self.update_status_lbl.setText("Checking for updates...")
+        if hasattr(self, "update_notes_box"):
+            self.update_notes_box.setText("")
 
         done = threading.Event()
 
@@ -1004,7 +1006,8 @@ class App(QWidget):
                 data = json.loads(raw.decode("utf-8", errors="ignore"))
                 tag = str(data.get("tag_name", "") or "")
                 assets = data.get("assets", []) or []
-                latest = {"tag": tag, "assets": assets}
+                body = str(data.get("body", "") or "")
+                latest = {"tag": tag, "assets": assets, "body": body}
             except Exception as e:
                 latest = {"error": str(e)}
 
@@ -1018,18 +1021,28 @@ class App(QWidget):
                         self.update_status_lbl.setText(f"Update check failed: {err}")
                     return
                 self._latest_release_info = latest
-                current = self._parse_version(APP_VERSION)
-                newest = self._parse_version(str(latest.get("tag", "")))
+                current_ver = APP_VERSION
+                current = self._parse_version(current_ver)
+                newest_tag = str(latest.get("tag", ""))
+                newest = self._parse_version(newest_tag)
                 if newest > current:
                     if hasattr(self, "update_status_lbl"):
-                        self.update_status_lbl.setText(f"New version available: {latest.get('tag')}")
+                        self.update_status_lbl.setText(
+                            f"New version available: {newest_tag} | Your version: {current_ver}"
+                        )
                     if hasattr(self, "btn_start_update"):
                         self.btn_start_update.setEnabled(True)
+                    if hasattr(self, "update_notes_box"):
+                        self.update_notes_box.setText(str(latest.get("body", "")))
                 else:
                     if hasattr(self, "update_status_lbl"):
-                        self.update_status_lbl.setText("You are up to date.")
+                        self.update_status_lbl.setText(
+                            f"You are up to date. Current version: {current_ver}"
+                        )
                     if hasattr(self, "btn_start_update"):
                         self.btn_start_update.setEnabled(False)
+                    if hasattr(self, "update_notes_box"):
+                        self.update_notes_box.setText(str(latest.get("body", "")))
 
             QTimer.singleShot(0, _apply)
 
@@ -1066,9 +1079,15 @@ class App(QWidget):
         asset = None
         for a in assets:
             name = str(a.get("name", "") or "")
-            if name.endswith("windows-amd64.zip"):
+            if name == "SlipstreamPlus-windows-amd64.zip":
                 asset = a
                 break
+        if not asset:
+            for a in assets:
+                name = str(a.get("name", "") or "")
+                if name.endswith("windows-amd64.zip"):
+                    asset = a
+                    break
         if not asset:
             if hasattr(self, "update_status_lbl"):
                 self.update_status_lbl.setText("Windows update package not found in release assets.")
@@ -1570,6 +1589,11 @@ class App(QWidget):
 
         self.update_status_lbl = QLabel("Check for updates to see if a newer version is available.")
         self.update_status_lbl.setStyleSheet("font-size: 12px;")
+        self.update_status_lbl.setWordWrap(True)
+        self.update_notes_box = QTextEdit()
+        self.update_notes_box.setReadOnly(True)
+        self.update_notes_box.setStyleSheet("background:#111;color:#cfcfcf;font-family:Consolas;font-size:11px;")
+        self.update_notes_box.setText("")
         self.btn_check_update = QPushButton("Check for Updates")
         self.btn_check_update.clicked.connect(lambda: self.check_for_updates(manual=True))
         self.btn_start_update = QPushButton("Update Now")
@@ -1577,6 +1601,8 @@ class App(QWidget):
         self.btn_start_update.clicked.connect(self.start_update_download)
 
         update_layout.addWidget(self.update_status_lbl)
+        update_layout.addSpacing(8)
+        update_layout.addWidget(self.update_notes_box)
         update_layout.addSpacing(8)
         update_layout.addWidget(self.btn_check_update)
         update_layout.addWidget(self.btn_start_update)
