@@ -105,25 +105,15 @@ jobs:
 
       - name: Package (ZIP)
         run: |
-          $tag = "${{ github.ref_name }}"
-          $zipName = "SlipstreamPlus-$tag-windows-amd64.zip"
+          $zipName = "SlipstreamPlus-windows-amd64.zip"
           if (Test-Path $zipName) { Remove-Item -Force $zipName }
           Compress-Archive -Path "dist\\SlipstreamPlus-Windows\\*" -DestinationPath $zipName
-
-      - name: Export Extra Release Assets
-        run: |
-          $tag = "${{ github.ref_name }}"
-          Copy-Item -Force "bin\\dnstt-client-windows-amd64.exe" "dnstt-client-$tag-windows-amd64.exe"
-          Copy-Item -Force "bin\\wintun.dll" "wintun-$tag-windows-amd64.dll"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: SlipstreamPlus-Windows
-          path: |
-            SlipstreamPlus-${{ github.ref_name }}-windows-amd64.zip
-            dnstt-client-${{ github.ref_name }}-windows-amd64.exe
-            wintun-${{ github.ref_name }}-windows-amd64.dll
+          path: SlipstreamPlus-windows-amd64.zip
 
   build-linux:
     runs-on: ubuntu-latest
@@ -178,13 +168,13 @@ jobs:
       - name: Package (ZIP)
         run: |
           cd dist
-          zip -r "../SlipstreamPlus-${{ github.ref_name }}-linux-amd64.zip" SlipstreamPlus-Linux
+          zip -r "../SlipstreamPlus-linux-amd64.zip" SlipstreamPlus-Linux
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: SlipstreamPlus-Linux
-          path: SlipstreamPlus-${{ github.ref_name }}-linux-amd64.zip
+          path: SlipstreamPlus-linux-amd64.zip
 
   release:
     runs-on: ubuntu-latest
@@ -208,10 +198,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/SlipstreamPlus-Windows/SlipstreamPlus-${{ github.ref_name }}-windows-amd64.zip
-            artifacts/SlipstreamPlus-Windows/dnstt-client-${{ github.ref_name }}-windows-amd64.exe
-            artifacts/SlipstreamPlus-Windows/wintun-${{ github.ref_name }}-windows-amd64.dll
-            artifacts/SlipstreamPlus-Linux/SlipstreamPlus-${{ github.ref_name }}-linux-amd64.zip
+            artifacts/SlipstreamPlus-Windows/SlipstreamPlus-windows-amd64.zip
+            artifacts/SlipstreamPlus-Linux/SlipstreamPlus-linux-amd64.zip
           prerelease: ${{ needs.detect-version.outputs.is_prerelease == 'true' }}
           generate_release_notes: true
           append_body: false
