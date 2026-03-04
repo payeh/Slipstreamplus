@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.6"
+APP_VERSION = "v1.1.7"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -185,6 +185,11 @@ DEFAULT_CONFIG: Dict[str, object] = {
     "cidr_expand_cap": 4096,   # max IPs to expand per CIDR when random_sample=0
     "real_ping_delay_ms": 2000,  # Slipstream ready timeout (ms)
     "scan_realtest": False,
+
+    # Scanner SOCKS5 auth (for real ping / ready checks)
+    "scanner_socks5_auth_enabled": False,
+    "scanner_socks5_username": "",
+    "scanner_socks5_password": "",
 }
 
 SPEED_TEST_URL = "https://cachefly.cachefly.net/10mb.test"
@@ -896,6 +901,66 @@ class App(QWidget):
         # Do not auto-load DNS list on startup
         atexit.register(self.force_stop)
 
+    def _update_scanner_socks5_auth_btn(self) -> None:
+        enabled = bool(self.config.get("scanner_socks5_auth_enabled", False))
+        if hasattr(self, "btn_scanner_socks_auth"):
+            self.btn_scanner_socks_auth.setText("SOCKS5 AUTH (Scanner): ON" if enabled else "SOCKS5 AUTH (Scanner): OFF")
+
+    def _get_scanner_socks5_auth(self) -> Tuple[str, str]:
+        if not bool(self.config.get("scanner_socks5_auth_enabled", False)):
+            return "", ""
+        u = str(self.config.get("scanner_socks5_username", "") or "").strip()
+        p = str(self.config.get("scanner_socks5_password", "") or "").strip()
+        if not u or not p:
+            return "", ""
+        return u, p
+
+    def open_scanner_socks5_auth_dialog(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Scanner SOCKS5 Auth")
+        layout = QVBoxLayout(dlg)
+
+        form = QFormLayout()
+        chk = QCheckBox("Enable SOCKS5 Auth for Scanner Tests")
+        chk.setChecked(bool(self.config.get("scanner_socks5_auth_enabled", False)))
+        form.addRow(chk)
+
+        user_in = QLineEdit(str(self.config.get("scanner_socks5_username", "") or ""))
+        pass_in = QLineEdit(str(self.config.get("scanner_socks5_password", "") or ""))
+        pass_in.setEchoMode(QLineEdit.Password)
+        form.addRow("Username:", user_in)
+        form.addRow("Password:", pass_in)
+        layout.addLayout(form)
+
+        def _sync():
+            en = chk.isChecked()
+            user_in.setEnabled(en)
+            pass_in.setEnabled(en)
+
+        chk.stateChanged.connect(_sync)
+        _sync()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def _on_ok():
+            en = chk.isChecked()
+            u = user_in.text().strip()
+            p = pass_in.text().strip()
+            if en and (not u or not p):
+                QMessageBox.warning(dlg, DIALOG_TITLE, "Username/Password required when SOCKS5 Auth is enabled.")
+                return
+            self.config["scanner_socks5_auth_enabled"] = bool(en)
+            self.config["scanner_socks5_username"] = u if en else ""
+            self.config["scanner_socks5_password"] = p if en else ""
+            save_config(self.config)
+            self._update_scanner_socks5_auth_btn()
+            dlg.accept()
+
+        buttons.accepted.connect(_on_ok)
+        buttons.rejected.connect(dlg.reject)
+        dlg.exec()
+
     # ================= UI =================
     def build_ui(self) -> None:
         self.tabs = QTabWidget()
@@ -1106,6 +1171,11 @@ class App(QWidget):
         settings_layout.addWidget(self.btn_pause_scan, 5, 0, 1, 2)
 
         left_col.addWidget(settings_box)
+
+        self.btn_scanner_socks_auth = QPushButton("SOCKS5 AUTH (Scanner)")
+        self.btn_scanner_socks_auth.clicked.connect(self.open_scanner_socks5_auth_dialog)
+        settings_layout.addWidget(self.btn_scanner_socks_auth, 6, 0, 1, 4)
+        self._update_scanner_socks5_auth_btn()
 
         list_box = QGroupBox("Dns List")
         list_layout = QVBoxLayout(list_box)
@@ -2654,6 +2724,7 @@ class App(QWidget):
 
     def _scan_realtest_worker_loop(self) -> None:
         self.emitter.scan_timer_start.emit()
+        scan_user, scan_pass = self._get_scanner_socks5_auth()
         while not self.closing:
             if not (hasattr(self, "scan_realtest_chk") and self.scan_realtest_chk.isChecked()):
                 break
@@ -2697,25 +2768,33 @@ class App(QWidget):
             port = 0
             try:
                 with self.scan_realtest_lock:
-                    proc, port, ready = self._run_slipstream_test(ip, domain, timeout=timeout_s)
+                    proc, port, ready = self._run_slipstream_test(
+                        ip,
+                        domain,
+                        timeout=timeout_s,
+                        username=scan_user,
+                        password=scan_pass,
+                    )
                     if not ready or not proc or port <= 0:
                         self.ping_queue.put((row, "TIMEOUT"))
                         self.scan_realtest_next_row += 1
                         continue
-                    ms, status = self._socks5_real_ping(
+                ms, status = self._socks5_real_ping(
+                    proxy_port=int(port),
+                    timeout=5.0,
+                    host="www.google.com",
+                    port=443,
+                    username=scan_user,
+                    password=scan_pass,
+                )
+                if status in ("SOCKS FAIL", "ERROR", "TIMEOUT"):
+                    ms, status = self._http_connect_real_ping(
                         proxy_port=int(port),
                         timeout=5.0,
                         host="www.google.com",
                         port=443,
                     )
-                    if status in ("SOCKS FAIL", "ERROR", "TIMEOUT"):
-                        ms, status = self._http_connect_real_ping(
-                            proxy_port=int(port),
-                            timeout=5.0,
-                            host="www.google.com",
-                            port=443,
-                        )
-                    self.ping_queue.put((row, status))
+                self.ping_queue.put((row, status))
             except Exception:
                 self.ping_queue.put((row, "ERROR"))
             finally:
@@ -4225,6 +4304,7 @@ class App(QWidget):
         self.scan_progress.setRange(0, max(1, self.real_ping_total))
         self.scan_progress.setValue(0)
         ready_timeout_ms = int(self.num_real_ping_delay.value())
+        scan_user, scan_pass = self._get_scanner_socks5_auth()
         orig_dns = self.connect_dns_input.text()
         orig_port = int(self.mixed_port_input.value())
         orig_internal_port = getattr(self, "internal_port", None)
@@ -4255,7 +4335,7 @@ class App(QWidget):
                 self.internal_port = get_free_port()
                 self._restart_tunnel_only(ip)
                 timeout_s = max(0.2, ready_timeout_ms / 1000.0)
-                if not self._wait_for_slipstream_ready_or_socks(timeout=timeout_s):
+                if not self._wait_for_slipstream_ready_or_socks(timeout=timeout_s, username=scan_user, password=scan_pass):
                     self.ping_queue.put((row, "TIMEOUT"))
                     done_rows += 1
                     self.emitter.real_ping_progress.emit(done_rows)
@@ -4265,6 +4345,8 @@ class App(QWidget):
                     timeout=5.0,
                     host="www.google.com",
                     port=443,
+                    username=scan_user,
+                    password=scan_pass,
                 )
                 if status in ("SOCKS FAIL", "ERROR", "TIMEOUT"):
                     ms, status = self._http_connect_real_ping(
@@ -4607,7 +4689,16 @@ class App(QWidget):
         except Exception:
             return -1, "ERROR"
 
-    def _socks5_real_ping(self, proxy_port: int, timeout: float, host: str, port: int) -> Tuple[int, str]:
+    def _socks5_real_ping(
+        self,
+        proxy_port: int,
+        timeout: float,
+        host: str,
+        port: int,
+        *,
+        username: str = "",
+        password: str = "",
+    ) -> Tuple[int, str]:
         start = time.monotonic()
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -4618,10 +4709,25 @@ class App(QWidget):
                 pass
             sock.connect(("127.0.0.1", proxy_port))
 
-            # SOCKS5 handshake (no auth)
-            sock.sendall(b"\x05\x01\x00")
+            # SOCKS5 handshake (supports optional auth)
+            methods = [0x00, 0x02]  # no-auth + username/password
+            sock.sendall(bytes([0x05, len(methods), *methods]))
             resp = sock.recv(2)
-            if len(resp) != 2 or resp[0] != 0x05 or resp[1] != 0x00:
+            if len(resp) != 2 or resp[0] != 0x05:
+                sock.close()
+                return -1, "SOCKS FAIL"
+            if resp[1] == 0x02:
+                u = (username or "").encode("utf-8", errors="ignore")
+                p = (password or "").encode("utf-8", errors="ignore")
+                if not u or not p or len(u) > 255 or len(p) > 255:
+                    sock.close()
+                    return -1, "SOCKS FAIL"
+                sock.sendall(bytes([0x01, len(u)]) + u + bytes([len(p)]) + p)
+                aresp = sock.recv(2)
+                if len(aresp) != 2 or aresp[1] != 0x00:
+                    sock.close()
+                    return -1, "SOCKS FAIL"
+            elif resp[1] != 0x00:
                 sock.close()
                 return -1, "SOCKS FAIL"
 
