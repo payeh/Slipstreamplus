@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.9"
+APP_VERSION = "v1.1.10"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -1193,6 +1193,10 @@ class App(QWidget):
                 conn = ctx.wrap_socket(sock, server_hostname=host)
             else:
                 conn = sock
+            try:
+                conn.settimeout(timeout)
+            except Exception:
+                pass
 
             http_req = (
                 f"GET {path} HTTP/1.1\r\n"
@@ -1202,11 +1206,21 @@ class App(QWidget):
             ).encode("utf-8")
             conn.sendall(http_req)
             chunks = []
-            while True:
-                data = conn.recv(8192)
-                if not data:
-                    break
-                chunks.append(data)
+            deadline = time.monotonic() + max(3.0, float(timeout))
+            total = 0
+            max_bytes = 5 * 1024 * 1024
+            while time.monotonic() < deadline and total < max_bytes:
+                try:
+                    data = conn.recv(8192)
+                    if not data:
+                        break
+                    chunks.append(data)
+                    total += len(data)
+                except socket.timeout:
+                    # If we already have some data, stop; otherwise keep waiting until deadline.
+                    if chunks:
+                        break
+                    continue
             raw = b"".join(chunks)
         finally:
             try:
@@ -1218,8 +1232,45 @@ class App(QWidget):
         header_end = raw.find(b"\r\n\r\n")
         if header_end == -1:
             return raw
+        header_bytes = raw[:header_end].decode("iso-8859-1", errors="ignore")
         body = raw[header_end + 4 :]
+
+        # Handle chunked transfer encoding
+        if "transfer-encoding: chunked" in header_bytes.lower():
+            body = self._http_dechunk(body)
+
+        # Handle content-length trimming
+        for line in header_bytes.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                try:
+                    n = int(line.split(":", 1)[1].strip())
+                    body = body[:n]
+                except Exception:
+                    pass
+                break
         return body
+
+    @staticmethod
+    def _http_dechunk(body: bytes) -> bytes:
+        out = bytearray()
+        i = 0
+        ln = len(body)
+        while i < ln:
+            j = body.find(b"\r\n", i)
+            if j == -1:
+                break
+            try:
+                size = int(body[i:j].split(b";", 1)[0].strip(), 16)
+            except Exception:
+                break
+            i = j + 2
+            if size == 0:
+                break
+            if i + size > ln:
+                break
+            out.extend(body[i:i + size])
+            i += size + 2  # skip data + CRLF
+        return bytes(out)
 
     # ================= UI =================
     def build_ui(self) -> None:
