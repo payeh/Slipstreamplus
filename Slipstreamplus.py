@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.18"
+APP_VERSION = "v1.1.19"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -1325,6 +1325,8 @@ class App(QWidget):
         self.btn_proxy_import.clicked.connect(self.import_proxy_links)
         self.btn_proxy_add = QPushButton("Add Config")
         self.btn_proxy_add.clicked.connect(self.add_proxy_config_dialog)
+        self.btn_proxy_add_dns = QPushButton("Add Config DNS")
+        self.btn_proxy_add_dns.clicked.connect(self.add_proxy_config_dns_dialog)
         self.btn_proxy_copy = QPushButton("Copy Link")
         self.btn_proxy_copy.clicked.connect(self.copy_selected_proxy_link)
         self.btn_proxy_remove = QPushButton("Remove Selected")
@@ -1333,6 +1335,7 @@ class App(QWidget):
         self.btn_proxy_settings.clicked.connect(self.open_proxy_settings_dialog)
         proxy_controls.addWidget(self.btn_proxy_import)
         proxy_controls.addWidget(self.btn_proxy_add)
+        proxy_controls.addWidget(self.btn_proxy_add_dns)
         proxy_controls.addWidget(self.btn_proxy_copy)
         proxy_controls.addWidget(self.btn_proxy_remove)
         proxy_controls.addWidget(self.btn_proxy_settings)
@@ -2194,6 +2197,138 @@ class App(QWidget):
             base_remark = remarks_item.text().strip()
         remarks_item.setText(base_remark)
         remarks_item.setFont(QFont("Segoe UI Emoji"))
+
+    def add_proxy_config_dns_dialog(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Add Config DNS")
+        dlg.setWindowFlag(Qt.MSWindowsFixedSizeDialogHint, True)
+        dlg.setSizeGripEnabled(False)
+        form = QFormLayout(dlg)
+
+        type_edit = QComboBox()
+        type_edit.addItems(["SLIPSTREAM", "DNSTT"])
+        type_edit.setCurrentText("SLIPSTREAM")
+
+        domain_default = str(self.domain_input.text() or self.config.get("domain", "") or "").strip()
+        domain_edit = QLineEdit(domain_default)
+        domain_edit.setPlaceholderText("s.yourdomain.com")
+
+        dns_edit = QTextEdit()
+        dns_edit.setPlaceholderText("8.8.8.8\n8.8.4.4\n1.1.1.1\n1.0.0.1")
+        dns_edit.setFixedHeight(120)
+
+        multi_dns_chk = QCheckBox("Multi DNS (single config)")
+        multi_dns_chk.setChecked(False)
+
+        pubkey_edit = QLineEdit("")
+        pubkey_edit.setPlaceholderText("DNSTT public key (64 hex chars)")
+
+        form.addRow("type", type_edit)
+        form.addRow("domain", domain_edit)
+        form.addRow("dns list", dns_edit)
+        form.addRow("", multi_dns_chk)
+        form.addRow("DNSTT public key", pubkey_edit)
+
+        def _set_row_visible(field: QWidget, visible: bool) -> None:
+            field.setVisible(visible)
+            lbl = form.labelForField(field)
+            if lbl is not None:
+                lbl.setVisible(visible)
+
+        def _apply_type_ui() -> None:
+            ptype = type_edit.currentText().strip().upper()
+            is_dnstt = ptype == "DNSTT"
+            multi_dns_chk.setVisible(not is_dnstt)
+            _set_row_visible(pubkey_edit, is_dnstt)
+            if is_dnstt:
+                multi_dns_chk.setChecked(False)
+
+        type_edit.currentIndexChanged.connect(lambda _: _apply_type_ui())
+        _apply_type_ui()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        ptype = type_edit.currentText().strip().upper()
+        domain = domain_edit.text().strip()
+        if not self._is_valid_domain(domain):
+            QMessageBox.warning(self, DIALOG_TITLE, "Invalid domain.")
+            return
+
+        raw = dns_edit.toPlainText().replace(",", "\n")
+        ips: List[str] = []
+        for line in raw.splitlines():
+            ip = line.strip()
+            if not ip:
+                continue
+            if not is_valid_ip(ip):
+                QMessageBox.warning(self, DIALOG_TITLE, f"Invalid DNS IP: {ip}")
+                return
+            ips.append(ip)
+        if not ips:
+            QMessageBox.warning(self, DIALOG_TITLE, "DNS list cannot be empty.")
+            return
+
+        if ptype == "DNSTT":
+            if len(ips) != 1:
+                QMessageBox.warning(self, DIALOG_TITLE, "DNSTT supports only one DNS resolver.")
+                return
+            pubkey = pubkey_edit.text().strip()
+            if not is_valid_dnstt_pubkey_hex(pubkey):
+                QMessageBox.warning(self, DIALOG_TITLE, "Invalid DNSTT public key (must be 64 hex chars).")
+                return
+            dns_ip = ips[0]
+            data = {
+                "type": "DNSTT",
+                "remarks": dns_ip,
+                "address": dns_ip,
+                "domain": domain,
+                "port": "53",
+                "transport": "UDP",
+                "public_key": pubkey,
+                "username": "",
+                "password": "",
+            }
+            self._add_proxy_row(data)
+            self.emitter.log.emit("INFO", f"Proxy: Added DNSTT config {dns_ip} / {domain}")
+            return
+
+        if multi_dns_chk.isChecked():
+            dns_csv = _normalize_dns_csv(",".join(ips))
+            if not dns_csv:
+                QMessageBox.warning(self, DIALOG_TITLE, "Invalid DNS list.")
+                return
+            remarks = f"{len(_split_dns_csv(dns_csv))} DNS"
+            data = {
+                "type": "SLIPSTREAM",
+                "remarks": remarks,
+                "address": dns_csv,
+                "domain": domain,
+                "port": "53",
+                "transport": "UDP",
+                "cert": dns_csv,
+            }
+            self._add_proxy_row(data)
+            self.emitter.log.emit("INFO", f"Proxy: Added multi DNS config ({remarks}) / {domain}")
+            return
+
+        for dns_ip in ips:
+            data = {
+                "type": "SLIPSTREAM",
+                "remarks": dns_ip,
+                "address": dns_ip,
+                "domain": domain,
+                "port": "53",
+                "transport": "UDP",
+                "cert": dns_ip,
+            }
+            self._add_proxy_row(data)
+        self.emitter.log.emit("INFO", f"Proxy: Added {len(ips)} DNS config(s) / {domain}")
 
     def add_proxy_config_dialog(self) -> None:
         dlg = QDialog(self)
@@ -3442,6 +3577,14 @@ class App(QWidget):
                 pass
 
     # ================= Logging =================
+    def _append_log_line(self, box: QTextEdit, line: str, color: str | None = None) -> None:
+        if color:
+            box.append(f'<span style="color:{color};">{line}</span>')
+        else:
+            box.append(line)
+        sb = box.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     def logw(self, level: str, msg: str) -> None:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         level = (level or "INFO").upper()
@@ -3476,24 +3619,18 @@ class App(QWidget):
             target = "connect"
 
         if target == "main":
-            self.log_box.append(f'<span style="color:{color};">{line}</span>')
-            sb = self.log_box.verticalScrollBar()
-            sb.setValue(sb.maximum())
+            self._append_log_line(self.log_box, line, color)
         elif target == "connect":
             try:
-                self.connect_log_box.append(line)
-                sb2 = self.connect_log_box.verticalScrollBar()
-                sb2.setValue(sb2.maximum())
+                self._append_log_line(self.connect_log_box, line, color)
             except Exception:
                 pass
         else:
             try:
                 if self.proxy_log_box.document().blockCount() >= 100:
                     self.proxy_log_box.clear()
-                    self.proxy_log_box.append("========= AUTO CLEAR =============")
-                self.proxy_log_box.append(line)
-                sb3 = self.proxy_log_box.verticalScrollBar()
-                sb3.setValue(sb3.maximum())
+                    self._append_log_line(self.proxy_log_box, "========= AUTO CLEAR =============", "#aaaaaa")
+                self._append_log_line(self.proxy_log_box, line, color)
             except Exception:
                 pass
 
