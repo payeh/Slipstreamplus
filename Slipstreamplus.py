@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.15"
+APP_VERSION = "v1.1.17"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -502,55 +502,57 @@ class ActiveBadgeDelegate(QStyledItemDelegate):
 
         pen_color = opt.palette.color(QPalette.HighlightedText) if opt.state & QStyle.State_Selected else opt.palette.color(QPalette.Text)
         painter.save()
-        painter.setFont(opt.font)
-        painter.setPen(pen_color)
+        try:
+            painter.setFont(opt.font)
+            painter.setPen(pen_color)
 
-        x = rect.left()
-        y = rect.center().y() + (fm.ascent() - fm.descent()) // 2
+            x = rect.left()
+            y = rect.center().y() + (fm.ascent() - fm.descent()) // 2
 
-        if before_text:
-            painter.drawText(x, y, before_text)
-            x += fm.horizontalAdvance(before_text)
+            if before_text:
+                painter.drawText(x, y, before_text)
+                x += fm.horizontalAdvance(before_text)
 
-        if svg_path:
-            flag_h = min(rect.height(), fm.height())
-            flag_w = int(flag_h * 4 / 3)
-            flag_rect = QRectF(x + 4, rect.center().y() - flag_h / 2, flag_w, flag_h)
-            try:
-                renderer = QSvgRenderer(svg_path)
-                renderer.render(painter, flag_rect)
-                x = flag_rect.right() + 4
-            except Exception:
-                pass
+            if svg_path:
+                flag_h = min(rect.height(), fm.height())
+                flag_w = int(flag_h * 4 / 3)
+                flag_rect = QRectF(x + 4, rect.center().y() - flag_h / 2, flag_w, flag_h)
+                try:
+                    renderer = QSvgRenderer(svg_path)
+                    renderer.render(painter, flag_rect)
+                    x = flag_rect.right() + 4
+                except Exception:
+                    pass
 
-        if after_text:
-            painter.drawText(x, y, after_text)
-
-        painter.restore()
+            if after_text:
+                painter.drawText(x, y, after_text)
+        finally:
+            painter.restore()
 
         if not is_active:
             return
 
         painter.save()
-        rect = opt.rect.adjusted(6, 0, -6, 0)
+        try:
+            rect = opt.rect.adjusted(6, 0, -6, 0)
 
-        fm = painter.fontMetrics()
-        badge_text = "Active"
-        badge_w = fm.horizontalAdvance(badge_text) + 12
-        badge_h = max(16, fm.height() - 2)
+            fm = painter.fontMetrics()
+            badge_text = "Active"
+            badge_w = fm.horizontalAdvance(badge_text) + 12
+            badge_h = max(16, fm.height() - 2)
 
-        badge_rect = rect
-        badge_rect.setLeft(rect.right() - badge_w)
-        badge_rect.setTop(rect.center().y() - badge_h // 2)
-        badge_rect.setBottom(badge_rect.top() + badge_h)
+            badge_rect = rect
+            badge_rect.setLeft(rect.right() - badge_w)
+            badge_rect.setTop(rect.center().y() - badge_h // 2)
+            badge_rect.setBottom(badge_rect.top() + badge_h)
 
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#e53935"))
-        painter.drawRoundedRect(badge_rect, 6, 6)
-        painter.setPen(QColor("#ffffff"))
-        painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
-
-        painter.restore()
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#e53935"))
+            painter.drawRoundedRect(badge_rect, 6, 6)
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(badge_rect, Qt.AlignCenter, badge_text)
+        finally:
+            painter.restore()
 
     @staticmethod
     def _split_flag_text(text: str) -> Tuple[str, str, Optional[str]]:
@@ -792,6 +794,8 @@ class App(QWidget):
         self._tunnel_restart_in_progress = False
         self._tunnel_restart_count = 0
         self._tunnel_restart_last_ts = 0.0
+        self._singbox_refused_ts = 0.0
+        self._singbox_refused_count = 0
 
         # scanner
         self.scan_running = False
@@ -805,6 +809,9 @@ class App(QWidget):
         self.scan_realtest_lock = threading.Lock()
         self.scan_realtest_next_row = 0
         self.scan_lock = threading.Lock()
+        self.scan_rows_lock = threading.Lock()
+        self.scan_rows_cache: List[str] = []
+        self.scan_realtest_processed = set()
         self.scan_total = 0
         self.scan_checked = 0
         self.scan_success = 0
@@ -3100,7 +3107,8 @@ class App(QWidget):
         while not self.closing:
             if not (hasattr(self, "scan_realtest_chk") and self.scan_realtest_chk.isChecked()):
                 break
-            row_count = self.scan_table.rowCount()
+            with self.scan_rows_lock:
+                row_count = len(self.scan_rows_cache)
             if self.scan_realtest_next_row >= row_count:
                 if self.scan_running:
                     time.sleep(0.2)
@@ -3111,14 +3119,12 @@ class App(QWidget):
                 break
 
             row = self.scan_realtest_next_row
-            ip_item = self.scan_table.item(row, 0)
-            ip = ip_item.text().strip() if ip_item else ""
-            ping_item = self.scan_table.item(row, 3)
-            existing = ping_item.text().strip() if ping_item else ""
+            with self.scan_rows_lock:
+                ip = self.scan_rows_cache[row].strip() if 0 <= row < len(self.scan_rows_cache) else ""
             if not ip:
                 self.scan_realtest_next_row += 1
                 continue
-            if existing and existing not in ("Queued", "Testing..."):
+            if row in self.scan_realtest_processed:
                 self.scan_realtest_next_row += 1
                 continue
 
@@ -3176,6 +3182,7 @@ class App(QWidget):
                         proc.wait(timeout=2)
                 except Exception:
                     pass
+            self.scan_realtest_processed.add(row)
             self.scan_realtest_next_row += 1
         if not self.scan_running and not self.real_ping_running:
             QTimer.singleShot(0, self._scan_ui_tick)
@@ -4231,6 +4238,8 @@ class App(QWidget):
                         item.setForeground(QColor("#111111"))
             self._center_scan_row(row)
             self._center_scan_row(row)
+            with self.scan_rows_lock:
+                self.scan_rows_cache.append(ip)
             if hasattr(self, "scan_realtest_chk") and self.scan_realtest_chk.isChecked():
                 self.scan_table.setItem(row, 3, QTableWidgetItem("Queued"))
                 if not self.scan_realtest_worker or not self.scan_realtest_worker.is_alive():
@@ -4417,6 +4426,9 @@ class App(QWidget):
 
     def clear_scan_results(self, clear_log: bool = True) -> None:
         self.scan_table.setRowCount(0)
+        with self.scan_rows_lock:
+            self.scan_rows_cache = []
+            self.scan_realtest_processed = set()
         if clear_log:
             self.log_box.clear()
             while not self.scan_log_queue.empty():
@@ -4683,13 +4695,15 @@ class App(QWidget):
         self.scan_progress.setValue(0)
         ready_timeout_ms = int(self.num_real_ping_delay.value())
         scan_user, scan_pass = self._get_scanner_socks5_auth()
+        with self.scan_rows_lock:
+            scan_ips = list(self.scan_rows_cache)
         orig_dns = self.connect_dns_input.text()
         orig_port = int(self.mixed_port_input.value())
         orig_internal_port = getattr(self, "internal_port", None)
         orig_api_port = getattr(self, "api_port", None)
 
         def _worker():
-            total_rows = self.scan_table.rowCount()
+            total_rows = len(scan_ips)
             done_rows = 0
             for row in range(total_rows):
                 if self.closing:
@@ -4698,12 +4712,7 @@ class App(QWidget):
                     break
                 if self.real_ping_stop.is_set():
                     break
-                ip_item = self.scan_table.item(row, 0)
-                if not ip_item:
-                    done_rows += 1
-                    self.emitter.real_ping_progress.emit(done_rows)
-                    continue
-                ip = ip_item.text().strip()
+                ip = scan_ips[row].strip() if 0 <= row < len(scan_ips) else ""
                 if not ip:
                     done_rows += 1
                     self.emitter.real_ping_progress.emit(done_rows)
@@ -6065,6 +6074,10 @@ class App(QWidget):
                 self.proc_tunnel = None
                 # Re-spawn tunnel using existing internal_port (sing-box outbound points here).
                 self.spawn_tunnel(self.current_dns_ip, self.current_domain)
+                # Wait briefly for tunnel to become ready; if not, force full reconnect.
+                ready = self._wait_for_slipstream_ready_or_socks(timeout=8.0)
+                if not ready:
+                    self.emitter.connection_drop.emit("Tunnel restart failed; forcing reconnect.")
             finally:
                 self._tunnel_restart_in_progress = False
 
@@ -6171,6 +6184,20 @@ class App(QWidget):
                         self.slipstream_ready_event.set()
                     if "Server certificate pinning is disabled" in msg:
                         continue
+                if tag == "SING-BOX":
+                    lowmsg = msg.lower()
+                    if "connectex" in lowmsg and "actively refused" in lowmsg and "127.0.0.1:" in lowmsg:
+                        now = time.time()
+                        if now - float(getattr(self, "_singbox_refused_ts", 0.0)) < 5.0:
+                            self._singbox_refused_count = int(getattr(self, "_singbox_refused_count", 0) or 0) + 1
+                        else:
+                            self._singbox_refused_count = 1
+                        self._singbox_refused_ts = now
+                        if self._singbox_refused_count >= 3:
+                            # Trigger tunnel restart if proxy listener is refused repeatedly.
+                            self.emitter.log.emit("WARN", "Proxy: repeated SOCKS refused; restarting tunnel...")
+                            self._restart_tunnel_only_for_health("sing-box refused SOCKS connect")
+                            self._singbox_refused_count = 0
                 if tag == "DNSTT":
                     # DNSTT readiness is detected via SOCKS probe, keep logs only.
                     pass
