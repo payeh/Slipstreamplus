@@ -127,7 +127,7 @@ def config_path(filename: str) -> str:
 # ================= CONSTANTS & CONFIG =================
 APP_ID = "Farhad.Slipstreamplus.v1"
 APP_TITLE = "Slipstream Plus"
-APP_VERSION = "v1.1.19"
+APP_VERSION = "v1.1.20"
 DIALOG_TITLE = APP_TITLE
 ICON_NAME = "icon.ico"
 
@@ -179,14 +179,15 @@ DEFAULT_CONFIG: Dict[str, object] = {
     "slipstream_client_url": "",
 
     # Scanner
-    "fastscan_timeout_ms": 800,
-    "fastscan_threads": 200,
+    "fastscan_timeout_ms": 1000,
+    "fastscan_threads": 30,
     "cidr_random_sample": 0,   # 0 = off
     "cidr_expand_cap": 4096,   # max IPs to expand per CIDR when random_sample=0
     "real_ping_delay_ms": 2000,  # Slipstream ready timeout (ms)
     "scan_realtest": False,
+    "scan_focus_range": False,
 
-    # Scanner SOCKS5 auth (for real ping / ready checks)
+    # Scanner SOCKS5 auth (for proxy test / ready checks)
     "scanner_socks5_auth_enabled": False,
     "scanner_socks5_username": "",
     "scanner_socks5_password": "",
@@ -328,7 +329,7 @@ def is_success_result(result: str) -> bool:
     return ("ok" in low) or ("alive" in low)
 
 
-def _cidr_sample_ips(cidr: str, sample: int, cap: int) -> List[str]:
+def _cidr_sample_ips(cidr: str, sample: int, cap: int):
     try:
         net = ipaddress.ip_network(cidr, strict=False)
     except Exception:
@@ -356,11 +357,8 @@ def _cidr_sample_ips(cidr: str, sample: int, cap: int) -> List[str]:
         picks = random.sample(range(start, end), k)
         return [str(net.network_address + int(off)) for off in picks]
 
-    # non-random: take first k without expanding all
-    k = min(cap, count)
-    if k <= 0:
-        return []
-    return [str(net.network_address + int(off)) for off in range(start, start + k)]
+    # non-random: return full range as iterator to avoid huge memory use
+    return (str(net.network_address + int(off)) for off in range(start, end))
 
 
 def load_config() -> Dict[str, object]:
@@ -799,6 +797,7 @@ class App(QWidget):
 
         # scanner
         self.scan_running = False
+        self.scan_starting = False
         self.scan_stop = threading.Event()
         self.scan_threads: List[threading.Thread] = []
         self.scan_pause_event = threading.Event()
@@ -817,6 +816,8 @@ class App(QWidget):
         self.scan_success = 0
         self.scan_fail = 0
         self.scan_produced = 0
+        self.scan_enqueued: set[str] = set()
+        self.scan_focus_ranges: set[str] = set()
         self.closing = False
         self.real_ping_running = False
         self.real_ping_stop = threading.Event()
@@ -837,6 +838,11 @@ class App(QWidget):
         self._imported_dns_list: List[str] = []
         self._loading_proxy_rows = False
         self._latest_release_info: Optional[Dict[str, object]] = None
+        self.scan_start_time = 0.0
+        self.scan_last_rate_time = 0.0
+        self.scan_last_checked = 0
+        self.scan_rate_ema = 0.0
+        self.scan_last_stats_ts = 0.0
 
         # signals
         self.emitter = Emitter()
@@ -913,6 +919,16 @@ class App(QWidget):
         enabled = bool(self.config.get("scanner_socks5_auth_enabled", False))
         if hasattr(self, "btn_scanner_socks_auth"):
             self.btn_scanner_socks_auth.setText("SOCKS5 AUTH (Scanner): ON" if enabled else "SOCKS5 AUTH (Scanner): OFF")
+
+    def _on_random_count_changed(self) -> None:
+        try:
+            enabled = int(self.num_random_count.value()) > 0
+            if hasattr(self, "scan_focus_range_chk"):
+                self.scan_focus_range_chk.setEnabled(enabled)
+                if not enabled:
+                    self.scan_focus_range_chk.setChecked(False)
+        except Exception:
+            pass
 
     def _get_scanner_socks5_auth(self) -> Tuple[str, str]:
         if not bool(self.config.get("scanner_socks5_auth_enabled", False)):
@@ -1487,6 +1503,7 @@ class App(QWidget):
         self.num_random_count.setRange(0, 100000)
         self.num_random_count.setValue(int(self.config.get("cidr_random_sample", 0)))
         settings_layout.addWidget(self.num_random_count, 1, 2, 1, 2)
+        self.num_random_count.valueChanged.connect(self._on_random_count_changed)
 
         settings_layout.addWidget(QLabel("Domain To Check:"), 2, 0)
         self.domain_input = QLineEdit(str(self.config.get("domain", "")))
@@ -1499,10 +1516,10 @@ class App(QWidget):
         self.num_timeout.setValue(int(self.config.get("fastscan_timeout_ms", 1000)))
         settings_layout.addWidget(self.num_timeout, 3, 1)
 
-        settings_layout.addWidget(QLabel("Max Parallelism:"), 3, 2)
+        settings_layout.addWidget(QLabel("Threads:"), 3, 2)
         self.num_parallelism = QSpinBox()
         self.num_parallelism.setRange(1, 1000)
-        self.num_parallelism.setValue(int(self.config.get("fastscan_threads", 120)))
+        self.num_parallelism.setValue(int(self.config.get("fastscan_threads", 30)))
         settings_layout.addWidget(self.num_parallelism, 3, 3)
 
         settings_layout.addWidget(QLabel("Slipstream Ready Timeout (ms):"), 4, 0)
@@ -1510,19 +1527,24 @@ class App(QWidget):
         self.num_real_ping_delay.setRange(0, 60000)
         self.num_real_ping_delay.setValue(int(self.config.get("real_ping_delay_ms", 2000)))
         settings_layout.addWidget(self.num_real_ping_delay, 4, 1)
-        self.scan_realtest_chk = QCheckBox("Real Test During Scan")
+        self.scan_realtest_chk = QCheckBox("Proxy Test During Scan")
         self.scan_realtest_chk.setChecked(bool(self.config.get("scan_realtest", False)))
         self.scan_realtest_chk.stateChanged.connect(self.on_scan_realtest_changed)
-        settings_layout.addWidget(self.scan_realtest_chk, 4, 2, 1, 2)
+        settings_layout.addWidget(self.scan_realtest_chk, 4, 2, 1, 1)
+
+        self.scan_focus_range_chk = QCheckBox("Focus Find Range")
+        self.scan_focus_range_chk.setChecked(bool(self.config.get("scan_focus_range", False)))
+        self.scan_focus_range_chk.setEnabled(self.num_random_count.value() > 0)
+        settings_layout.addWidget(self.scan_focus_range_chk, 4, 3, 1, 1)
 
         self.btn_scan = QPushButton("Start Scan")
         self.btn_scan.clicked.connect(self.start_fast_scan)
-        settings_layout.addWidget(self.btn_scan, 5, 2, 1, 2)
+        settings_layout.addWidget(self.btn_scan, 5, 0, 1, 2)
 
         self.btn_pause_scan = QPushButton("Pause Scan")
         self.btn_pause_scan.setEnabled(False)
         self.btn_pause_scan.clicked.connect(self.toggle_pause_scan)
-        settings_layout.addWidget(self.btn_pause_scan, 5, 0, 1, 2)
+        settings_layout.addWidget(self.btn_pause_scan, 5, 2, 1, 2)
 
         left_col.addWidget(settings_box)
 
@@ -1535,7 +1557,7 @@ class App(QWidget):
         list_layout = QVBoxLayout(list_box)
 
         self.scan_table = QTableWidget(0, 4)
-        self.scan_table.setHorizontalHeaderLabels(["DNS IP", "Time (ms)", "Detail", "Real Ping"])
+        self.scan_table.setHorizontalHeaderLabels(["DNS IP", "Time (ms)", "Detail", "Proxy Test"])
         self.scan_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.scan_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.scan_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -1552,7 +1574,7 @@ class App(QWidget):
         self.btn_save.clicked.connect(self.show_save_ips_menu)
         self.btn_clear = QPushButton("Clear List")
         self.btn_clear.clicked.connect(self.clear_scan_results)
-        self.btn_real_ping = QPushButton("Test Real Ping")
+        self.btn_real_ping = QPushButton("Test Proxy")
         self.btn_real_ping.clicked.connect(self.test_real_ping)
         btn_row.addWidget(self.btn_save)
         btn_row.addWidget(self.btn_clear)
@@ -1566,6 +1588,9 @@ class App(QWidget):
         self.scan_progress.setTextVisible(True)
         self.scan_progress.setFormat("%p%")
         left_col.addWidget(self.scan_progress)
+        self.scan_stats_lbl = QLabel("Elapsed: 00:00:00 | Remaining: --:--:-- | Speed: 0 IPs/Sec")
+        self.scan_stats_lbl.setStyleSheet("color: #bdbdbd; font-size: 11px;")
+        left_col.addWidget(self.scan_stats_lbl)
 
         self.lbl_status_scanner = QLabel("Coder  : Farhad~UK")
         self.lbl_status_scanner.setEnabled(False)
@@ -3968,11 +3993,13 @@ class App(QWidget):
         self.config["cidr_random_sample"] = int(self.num_random_count.value())
         self.config["real_ping_delay_ms"] = int(self.num_real_ping_delay.value())
         self.config["scan_realtest"] = bool(self.scan_realtest_chk.isChecked())
+        if hasattr(self, "scan_focus_range_chk"):
+            self.config["scan_focus_range"] = bool(self.scan_focus_range_chk.isChecked())
         save_config(self.config)
 
     def on_scan_realtest_changed(self) -> None:
         if self.scan_realtest_chk.isChecked() and (self.running or self.reconnecting):
-            QMessageBox.warning(self, DIALOG_TITLE, "Disable proxy connection before enabling Real Test During Scan.")
+            QMessageBox.warning(self, DIALOG_TITLE, "Disable proxy connection before enabling Proxy Test During Scan.")
             self.scan_realtest_chk.blockSignals(True)
             self.scan_realtest_chk.setChecked(False)
             self.scan_realtest_chk.blockSignals(False)
@@ -3980,13 +4007,15 @@ class App(QWidget):
             self.btn_real_ping.setEnabled(not self.scan_realtest_chk.isChecked())
 
     def start_fast_scan(self, ips: Optional[List[str]] = None) -> None:
+        if self.scan_starting:
+            return
         if self.scan_running:
             self.stop_fast_scan()
             return
 
         if hasattr(self, "scan_realtest_chk") and self.scan_realtest_chk.isChecked():
             if self.running or self.reconnecting:
-                QMessageBox.warning(self, DIALOG_TITLE, "Disable proxy connection to use Real Test During Scan.")
+                QMessageBox.warning(self, DIALOG_TITLE, "Disable proxy connection to use Proxy Test During Scan.")
                 return
 
         domain = self.domain_input.text().strip()
@@ -4001,6 +4030,7 @@ class App(QWidget):
 
         self.persist_scan_settings()
 
+        self.scan_starting = True
         self.scan_running = True
         self.scan_pause_event.set()
         self.scan_stop = threading.Event()
@@ -4010,6 +4040,8 @@ class App(QWidget):
         self.scan_realtest_next_row = 0
         self.btn_browse.setEnabled(False)
         self.num_random_count.setEnabled(False)
+        if hasattr(self, "scan_focus_range_chk"):
+            self.scan_focus_range_chk.setEnabled(False)
 
         timeout_ms = int(self.num_timeout.value())
         threads = int(self.num_parallelism.value())
@@ -4022,6 +4054,13 @@ class App(QWidget):
 
         self.scan_target_queue: Queue[str] = Queue(maxsize=10000)
         self.scan_producer_done = threading.Event()
+        self.scan_enqueued = set()
+        self.scan_focus_ranges = set()
+        self.scan_start_time = time.time()
+        self.scan_last_rate_time = self.scan_start_time
+        self.scan_last_checked = 0
+        self.scan_rate_ema = 0.0
+        self.scan_last_stats_ts = self.scan_start_time
 
         def _load_and_start():
             source = "file" if use_file else "dns"
@@ -4037,6 +4076,7 @@ class App(QWidget):
             if total <= 0:
                 self.emitter.log.emit("WARN", "No IPs found.")
                 self._scan_finish_ui_reset()
+                self.scan_starting = False
                 return
 
             with self.scan_lock:
@@ -4066,9 +4106,12 @@ class App(QWidget):
                     for ip in iterator:
                         if self.scan_stop.is_set():
                             break
-                        self.scan_target_queue.put(ip)
                         with self.scan_lock:
+                            if ip in self.scan_enqueued:
+                                continue
+                            self.scan_enqueued.add(ip)
                             self.scan_produced += 1
+                        self.scan_target_queue.put(ip)
                 except Exception as e:
                     if not self.closing:
                         self._enqueue_scan_log(f"Producer error: {e}")
@@ -4102,6 +4145,9 @@ class App(QWidget):
                             self.scan_fail += 1
                         self.scan_processed.add(ip)
                     self.scan_queue.put((ip, res, threading.get_ident()))
+                    if use_random and is_success_result(res) and hasattr(self, "scan_focus_range_chk"):
+                        if self.scan_focus_range_chk.isChecked():
+                            self._enqueue_focus_range(ip)
 
             threading.Thread(target=producer, daemon=True).start()
 
@@ -4110,6 +4156,8 @@ class App(QWidget):
                 t = threading.Thread(target=worker, daemon=True)
                 self.scan_threads.append(t)
                 t.start()
+
+            self.scan_starting = False
 
             def waiter():
                 for t in self.scan_threads:
@@ -4137,6 +4185,7 @@ class App(QWidget):
                         break
         except Exception:
             pass
+        self.scan_starting = False
 
     def _scan_finish_ui_reset(self) -> None:
         self.scan_running = False
@@ -4146,7 +4195,40 @@ class App(QWidget):
         self.btn_pause_scan.setText("Pause Scan")
         self.btn_browse.setEnabled(True)
         self.num_random_count.setEnabled(True)
+        if hasattr(self, "scan_focus_range_chk"):
+            self._on_random_count_changed()
         self.emitter.scan_timer_stop.emit()
+
+    def _enqueue_focus_range(self, ip: str) -> None:
+        try:
+            parts = ip.strip().split(".")
+            if len(parts) != 4:
+                return
+            base = ".".join(parts[:3])
+            if not base:
+                return
+            with self.scan_lock:
+                if base in self.scan_focus_ranges:
+                    return
+                self.scan_focus_ranges.add(base)
+            added = 0
+            for i in range(0, 256):
+                if self.scan_stop.is_set():
+                    return
+                cand = f"{base}.{i}"
+                with self.scan_lock:
+                    if cand in self.scan_enqueued or cand in self.scan_processed:
+                        continue
+                    self.scan_enqueued.add(cand)
+                    self.scan_produced += 1
+                    self.scan_total += 1
+                    added += 1
+                self.scan_target_queue.put(cand)
+            if added > 0:
+                self.emitter.scan_stats_updated.emit()
+                self._enqueue_scan_log(f"Focus range queued: {base}.0/24 (+{added})")
+        except Exception:
+            return
 
     def _start_scan_ui_timer(self) -> None:
         if self.scan_ui_timer.isActive():
@@ -4154,23 +4236,6 @@ class App(QWidget):
         self.scan_ui_timer.start()
 
     def _stop_scan_ui_timer(self) -> None:
-        self.scan_ui_timer.stop()
-
-    def stop_fast_scan(self) -> None:
-        if not self.scan_running:
-            return
-        self.emitter.log.emit("WARN", "Stopping scan...")
-        self.scan_stop.set()
-        self.scan_pause_event.set()
-
-    def _scan_finish_ui_reset(self) -> None:
-        self.scan_running = False
-        self.btn_scan.setText("Start Scan")
-        self.btn_scan.setEnabled(True)
-        self.btn_pause_scan.setEnabled(False)
-        self.btn_pause_scan.setText("Pause Scan")
-        self.btn_browse.setEnabled(True)
-        self.num_random_count.setEnabled(True)
         self.scan_ui_timer.stop()
 
     def _count_targets_in_file(self, path: str, use_random: bool, random_count: int) -> int:
@@ -4207,6 +4272,33 @@ class App(QWidget):
                     elif kind == "ip" and val:
                         total += 1
             return total
+        finally:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+    def _read_scan_file_tokens(self, path: str) -> List[str]:
+        try:
+            f = open(path, "r", encoding="utf-8", errors="ignore")
+        except Exception:
+            return []
+        tokens: List[str] = []
+        try:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("#") or line.startswith("//"):
+                    continue
+                line = line.split("#", 1)[0].split("//", 1)[0].strip()
+                for t in line.replace(";", " ").replace(",", " ").split():
+                    if not t:
+                        continue
+                    kind, val = _parse_scan_token(t)
+                    if kind in ("cidr", "ip") and val:
+                        tokens.append(val)
+            return tokens
         finally:
             try:
                 f.close()
@@ -4281,6 +4373,9 @@ class App(QWidget):
             checked = self.scan_checked
             success = self.scan_success
             fail = self.scan_fail
+            start_ts = self.scan_start_time
+            last_ts = self.scan_last_rate_time
+            last_checked = self.scan_last_checked
 
         self.lbl_total.setText(f"Total: {total}")
         self.lbl_checked.setText(f"Checked: {checked}")
@@ -4301,6 +4396,40 @@ class App(QWidget):
             else:
                 self.scan_progress.setRange(0, rp_total)
                 self.scan_progress.setValue(min(rp_done, rp_total))
+        try:
+            if hasattr(self, "scan_stats_lbl"):
+                now = time.time()
+                elapsed = max(0.0, now - start_ts) if start_ts else 0.0
+                if now - getattr(self, "scan_last_stats_ts", 0.0) >= 1.0:
+                    if now - last_ts >= 1.0:
+                        delta = max(0, checked - last_checked)
+                        inst_rate = delta / max(0.001, now - last_ts)
+                        if self.scan_rate_ema <= 0:
+                            self.scan_rate_ema = inst_rate
+                        else:
+                            self.scan_rate_ema = (self.scan_rate_ema * 0.9) + (inst_rate * 0.1)
+                        self.scan_last_rate_time = now
+                        self.scan_last_checked = checked
+                    avg_rate = checked / elapsed if elapsed > 0 else 0.0
+                    rate = avg_rate if avg_rate > 0 else max(0.0, self.scan_rate_ema)
+                    if checked > 0 and rate > 0:
+                        remaining = max(0, total - checked)
+                        eta = int(remaining / rate)
+                    else:
+                        eta = -1
+                    def _fmt(sec: int) -> str:
+                        if sec < 0:
+                            return "--:--:--"
+                        h = sec // 3600
+                        m = (sec % 3600) // 60
+                        s = sec % 60
+                        return f"{h:02d}:{m:02d}:{s:02d}"
+                    self.scan_stats_lbl.setText(
+                        f"Elapsed: {_fmt(int(elapsed))} | Remaining: {_fmt(eta)} | Speed: {rate:.0f} IPs/Sec"
+                    )
+                    self.scan_last_stats_ts = now
+        except Exception:
+            pass
 
         batch = 0
         while batch < 100:
@@ -4386,6 +4515,20 @@ class App(QWidget):
     def on_scan_finished(self) -> None:
         self._scan_finish_ui_reset()
         self._scan_ui_tick()
+        # Reload last opened list after scan to avoid errors on re-scan.
+        try:
+            if self.scan_file_path and os.path.exists(self.scan_file_path):
+                tokens = self._read_scan_file_tokens(self.scan_file_path)
+                if tokens:
+                    self._imported_dns_list = _normalize_lines(tokens)
+                    QTimer.singleShot(0, self.populate_dns_list)
+                try:
+                    has_plain_ips = self._file_has_plain_ips(self.scan_file_path)
+                    self.num_random_count.setEnabled(not has_plain_ips)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             if not (hasattr(self, "scan_realtest_chk") and self.scan_realtest_chk.isChecked()
                     and (self.scan_realtest_worker and self.scan_realtest_worker.is_alive()
@@ -4490,6 +4633,7 @@ class App(QWidget):
                 return
             if not t:
                 continue
+            kind, val = _parse_scan_token(t)
             if kind == "cidr" and val:
                 self._enqueue_scan_log(f"Reading CIDR: {val}...")
                 if use_random and random_count > 0:
@@ -4536,7 +4680,7 @@ class App(QWidget):
         act_all = QAction("Save All IPs", self)
         act_all.triggered.connect(self.save_scan_results)
         menu.addAction(act_all)
-        act_ok = QAction("Save Real Test OK IPs", self)
+        act_ok = QAction("Save Proxy Test OK IPs", self)
         act_ok.triggered.connect(self.save_real_ping_ok_results)
         menu.addAction(act_ok)
         menu.exec(self.btn_save.mapToGlobal(self.btn_save.rect().bottomLeft()))
@@ -4544,7 +4688,7 @@ class App(QWidget):
     def save_real_ping_ok_results(self) -> None:
         if self.scan_table.rowCount() == 0:
             return
-        path, _ = QFileDialog.getSaveFileName(self, APP_TITLE, "RealPing_OK_IPs.txt", "Text Files (*.txt)")
+        path, _ = QFileDialog.getSaveFileName(self, APP_TITLE, "ProxyTest_OK_IPs.txt", "Text Files (*.txt)")
         if not path:
             return
         saved = 0
@@ -4559,7 +4703,7 @@ class App(QWidget):
                     continue
                 f.write(f"{ip_item.text()}\n")
                 saved += 1
-        QMessageBox.information(self, DIALOG_TITLE, f"Saved {saved} IPs with Real Ping.")
+        QMessageBox.information(self, DIALOG_TITLE, f"Saved {saved} IPs with Proxy Test.")
 
     def clear_scan_results(self, clear_log: bool = True) -> None:
         self.scan_table.setRowCount(0)
@@ -4586,6 +4730,10 @@ class App(QWidget):
             self.scan_success = 0
             self.scan_fail = 0
             self.scan_processed = set()
+            self.scan_enqueued = set()
+            self.scan_focus_ranges = set()
+            self.scan_rate_ema = 0.0
+            self.scan_last_stats_ts = 0.0
         self._scan_ui_tick()
 
     def _enqueue_scan_log(self, text: str) -> None:
@@ -4715,7 +4863,7 @@ class App(QWidget):
 
     def set_dns_to_connect(self, ip: str) -> None:
         if self.real_ping_running:
-            self.emitter.log.emit("WARN", "Real Ping is running. Wait for it to finish.")
+            self.emitter.log.emit("WARN", "Proxy Test is running. Wait for it to finish.")
             return
         self.connect_dns_input.setText(ip)
         self._bold_scan_row_for_ip(ip)
@@ -4800,13 +4948,13 @@ class App(QWidget):
         prev_domain = self.current_domain
         prev_remark = self.current_proxy_remark
         if was_connected:
-            self.emitter.log.emit("INFO", "Real Ping: Disconnecting active proxy before test...")
+            self.emitter.log.emit("INFO", "Proxy Test: Disconnecting active proxy before test...")
             self.stop_connection()
         if self.scan_running:
             self.emitter.log.emit("WARN", "Scan is running. Stop scan first.")
             return
         if self.real_ping_running:
-            self.emitter.log.emit("WARN", "Stopping Real Ping...")
+            self.emitter.log.emit("WARN", "Stopping Proxy Test...")
             self.real_ping_stop.set()
             return
         if self.scan_table.rowCount() == 0:
@@ -4823,8 +4971,8 @@ class App(QWidget):
                 if item:
                     item.setBackground(QBrush())
                     item.setForeground(QBrush())
-        self.btn_real_ping.setText("Stop Real Ping")
-        self.emitter.log.emit("INFO", "Starting Real Ping (slipstream SOCKS test)...")
+        self.btn_real_ping.setText("Stop Proxy Test")
+        self.emitter.log.emit("INFO", "Starting Proxy Test (slipstream SOCKS test)...")
         self.emitter.scan_timer_start.emit()
         self.real_ping_total = self.scan_table.rowCount()
         self.real_ping_done = 0
@@ -4893,7 +5041,7 @@ class App(QWidget):
             self.mixed_port_input.setValue(orig_port)
             if was_connected and prev_dns and prev_domain:
                 self.current_proxy_remark = prev_remark
-                self.emitter.log.emit("INFO", "Real Ping: Restoring previous proxy connection...")
+                self.emitter.log.emit("INFO", "Proxy Test: Restoring previous proxy connection...")
                 self.emitter.connect_request.emit(prev_dns)
             if orig_internal_port is not None:
                 self.internal_port = orig_internal_port
@@ -4902,13 +5050,13 @@ class App(QWidget):
             self.real_ping_running = False
             self.real_ping_total = 0
             self.real_ping_done = 0
-            self.btn_real_ping.setText("Test Real Ping")
+            self.btn_real_ping.setText("Test Proxy")
             QTimer.singleShot(0, self._scan_ui_tick)
             self.emitter.scan_timer_stop.emit()
             if self.real_ping_stop.is_set():
-                self.emitter.log.emit("INFO", "Real Ping stopped.")
+                self.emitter.log.emit("INFO", "Proxy Test stopped.")
             else:
-                self.emitter.log.emit("INFO", "Real Ping finished.")
+                self.emitter.log.emit("INFO", "Proxy Test finished.")
 
         threading.Thread(target=_worker, daemon=True).start()
 
