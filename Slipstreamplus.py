@@ -432,32 +432,65 @@ def is_windows_admin() -> bool:
 
 
 # ================= System Proxy Utils =================
-INTERNET_SETTINGS = winreg.OpenKey(
-    winreg.HKEY_CURRENT_USER,
-    r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-    0,
-    winreg.KEY_ALL_ACCESS,
-)
+IS_WINDOWS = sys.platform.startswith("win")
+
+if IS_WINDOWS:
+    import winreg
+    import ctypes
+
+    INTERNET_SETTINGS = winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        0,
+        winreg.KEY_ALL_ACCESS,
+    )
+else:
+    INTERNET_SETTINGS = None
 
 
 def set_system_proxy(port: int) -> bool:
     try:
-        winreg.SetValueEx(INTERNET_SETTINGS, "ProxyEnable", 0, winreg.REG_DWORD, 1)
-        winreg.SetValueEx(INTERNET_SETTINGS, "ProxyServer", 0, winreg.REG_SZ, f"127.0.0.1:{port}")
-        ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)
-        ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)
+        if IS_WINDOWS:
+            winreg.SetValueEx(INTERNET_SETTINGS, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+            winreg.SetValueEx(
+                INTERNET_SETTINGS,
+                "ProxyServer",
+                0,
+                winreg.REG_SZ,
+                f"127.0.0.1:{port}",
+            )
+            ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)
+            ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)
+
+        else:
+            proxy = f"http://127.0.0.1:{port}"
+            os.environ["http_proxy"] = proxy
+            os.environ["https_proxy"] = proxy
+            os.environ["HTTP_PROXY"] = proxy
+            os.environ["HTTPS_PROXY"] = proxy
+
         return True
-    except Exception:
+
+    except Exception as e:
+        print(f"Proxy set failed: {e}")
         return False
 
 
 def clear_system_proxy() -> bool:
     try:
-        winreg.SetValueEx(INTERNET_SETTINGS, "ProxyEnable", 0, winreg.REG_DWORD, 0)
-        ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)
-        ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)
+        if IS_WINDOWS:
+            winreg.SetValueEx(INTERNET_SETTINGS, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+            ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)
+            ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)
+
+        else:
+            for key in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"]:
+                os.environ.pop(key, None)
+
         return True
-    except Exception:
+
+    except Exception as e:
+        print(f"Proxy clear failed: {e}")
         return False
 
 
